@@ -1,0 +1,240 @@
+#!/bin/bash
+#
+# A Script to build the base RightScale CentOS 5.4 Amazon Machine Image 
+#       ami-f8b35e91 (32 bit)
+#     or
+#       ami-ccb35ea5 (64 bit)
+#   Modified by the base rebuild script
+#       rc.dynamic.rebuild.local
+#     or
+#       rc.dynamic.rebuild.x64.local
+# Into a "db-core" server for CommonMap purposes
+#   http://commonmap.info/w/index.php/Server/Setup/Demonstration/AWS
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+# Variables
+
+# Take common variables from included bash scripts
+DIR="$( cd "$( dirname "$0" )" && pwd )"
+source $DIR/rc.dynamic.environment.inc.sh
+source $DIR/../local/secrets.$CM_ENV.inc.sh
+source $DIR/../local/settings.$CM_ENV.inc.sh
+
+PGSQL_SERVICE_SUFFIX=cm-core
+PGSQL_SERVICE_PORT=5432                  # osmosis only supports port 5432
+#PGSQL_SERVICE_DATA_DIR=/var/lib/pgsql/data
+PGSQL_SERVICE_DATA_DIR=/var/lib/pgsql/9.0/data
+#PGSQL_SERVICE_CONTRIB_DIR=/usr/share/pgsql/contrib
+PGSQL_SERVICE_CONTRIB_DIR=/usr/pgsql-9.0/share/contrib
+#PGSQL_SERVICE_INIT_FILE=/etc/init.d/postgresql
+PGSQL_SERVICE_INIT_FILE=/etc/init.d/postgresql-9.0
+
+PGSQL_SERVICE_PUBLIC_HOST=db-core.$CM_ENV.commonmap.org
+
+## Allow Webmin to access this database
+### TODO: Webmin is probably not useful if not running on native port 5432.
+
+#### Establish db-core service
+echo "####" 
+echo "#### Establish db-core service" 
+echo "####" 
+date 
+
+# New service, inherited from standard postgresql behaviours
+
+cp $PGSQL_SERVICE_INIT_FILE /etc/init.d/postgresql-$PGSQL_SERVICE_SUFFIX
+
+cat <<EOL > /etc/sysconfig/pgsql/postgresql-$PGSQL_SERVICE_SUFFIX
+
+PGDATA=$PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+PGPORT=$PGSQL_SERVICE_PORT
+
+EOL
+
+echo "## Create and attach EBS volume" 
+date 
+
+# Create and attach EBS volume.  Method inspired by:
+# http://alestic.com/2010/02/ec2-resize-running-ebs-root
+EBS_VOLUME_ID=$(ec2-create-volume --availability-zone $EC2_AVAILABILITY_ZONE --size $EBS_SIZE_GB_DB_CORE -K $EC2_PRIVATE_KEY -C $EC2_CERT | cut -f2)
+echo "New EBS volume created.  ID: $EBS_VOLUME_ID"
+
+# Volume creation takes a little time so we have to try repeatedly
+SELF_EC2_INSTANCE_ID=`curl http://169.254.169.254/latest/meta-data/instance-id` 
+ec2-attach-volume --instance $SELF_EC2_INSTANCE_ID --device $EBS_DEVICE_PATH_DB_CORE $EBS_VOLUME_ID -K $EC2_PRIVATE_KEY -C $EC2_CERT
+while ! ec2-describe-volumes $EBS_VOLUME_ID -K $EC2_PRIVATE_KEY -C $EC2_CERT | grep -q attached; do sleep 1; done
+echo "New EBS volume $EBS_VOLUME_ID attached to this EC2 instance $SELF_EC2_INSTANCE_ID as $EBS_DEVICE_PATH_DB_CORE"
+
+# Initialise the filesystem
+mkfs.ext3 -F -L $EBS_EXT3_LABEL_DB_CORE $EBS_DEVICE_PATH_DB_CORE
+
+# Mount it
+mkdir -p /mnt/$EBS_MOUNT_LOCATION_DB_CORE 
+mount $EBS_DEVICE_PATH_DB_CORE /mnt/$EBS_MOUNT_LOCATION_DB_CORE
+
+
+# New data directory for db-core
+mkdir -p /mnt/$EBS_MOUNT_LOCATION_DB_CORE/pgsql/data
+ln -s /mnt/$EBS_MOUNT_LOCATION_DB_CORE/pgsql/data $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+
+
+# Make postgres have full control of its directories
+chown -R postgres:postgres $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+chmod -R 700 $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+chown -R postgres:postgres /mnt/$EBS_MOUNT_LOCATION_DB_CORE/pgsql
+chmod -R 700 /mnt/$EBS_MOUNT_LOCATION_DB_CORE/pgsql
+
+
+echo "## Initialise and start database" 
+date 
+
+# Initialise database
+service postgresql-$PGSQL_SERVICE_SUFFIX initdb
+
+
+# Give postgres a self signed certificate so that clients can choose
+# to assert an encrypted connection
+# This has to happen between the service-initdb and service-start steps
+# TODO: This is experimental, 2010-10-31
+cd $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+openssl req -new -text -nodes -x509 -batch -days 3650 -subj "/C=AU/ST=Queensland/OU=CommonMap Inc/CN=$PGSQL_SERVICE_PUBLIC_HOST" -keyout server.key -out server.crt
+
+# Special treatment for the SSL material
+chown postgres:postgres $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/server.*
+chmod 600 $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/server.*
+
+
+# Start database service
+service postgresql-$PGSQL_SERVICE_SUFFIX start
+
+
+echo "## Sleeping 10 seconds ... hopefully the unix domain socket will be open by then" 
+date 
+sleep 10
+#### TODO:
+# createuser sometimes fails with
+#   createuser: could not connect to database postgres: could not connect to server: No such file or directory
+#   Is the server running locally and accepting
+#   connections on Unix domain socket "/tmp/.s.PGSQL.5432"?
+# We should probably test for
+# /tmp/.s.PGSQL.5432
+# before we continue, but maybe a sleep is a good enough hack.
+
+
+## Populate with database instances
+
+echo "## Populate with database instances" 
+date 
+
+# Create user roles (requires manual intervention to enter passwords)
+
+yes $PGSQL_SERVICE_PASSWORD | su - postgres -c "createuser --port $PGSQL_SERVICE_PORT commonmap_dv -s -P"
+yes $PGSQL_SERVICE_PASSWORD | su - postgres -c "createuser --port $PGSQL_SERVICE_PORT commonmap_ts -s -P"
+yes $PGSQL_SERVICE_PASSWORD | su - postgres -c "createuser --port $PGSQL_SERVICE_PORT commonmap_pr -s -P"
+
+# Create databases
+### TODO: Add template0 caveat to wiki
+
+su - postgres -c "createdb --port $PGSQL_SERVICE_PORT -T template0 -E UTF8 -O commonmap_dv commonmap_dv"
+su - postgres -c "createdb --port $PGSQL_SERVICE_PORT -T template0 -E UTF8 -O commonmap_ts commonmap_ts"
+su - postgres -c "createdb --port $PGSQL_SERVICE_PORT -T template0 -E UTF8 -O commonmap_pr commonmap_pr"
+
+# Create indexing methods
+
+su - postgres -c "psql --port $PGSQL_SERVICE_PORT -d commonmap_dv < $PGSQL_SERVICE_CONTRIB_DIR/btree_gist.sql"
+su - postgres -c "psql --port $PGSQL_SERVICE_PORT -d commonmap_ts < $PGSQL_SERVICE_CONTRIB_DIR/btree_gist.sql"
+su - postgres -c "psql --port $PGSQL_SERVICE_PORT -d commonmap_pr < $PGSQL_SERVICE_CONTRIB_DIR/btree_gist.sql"
+
+
+
+## Set up connection permissions
+
+echo "## Set up connection permissions" 
+date 
+
+
+# In postgresql.conf (append to existing configuration)
+
+cat <<EOL >> $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/postgresql.conf
+
+# CommonMap customisation - allows an application tier to connect remotely
+listen_addresses = '*'
+ssl = on
+
+EOL
+
+# In pg_hba.conf (substitute ident for trust authentication)
+
+sed -i 's/ident/trust/g' $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/pg_hba.conf
+      
+# In pg_hba.conf (append to existing configuration)
+
+cat <<EOL >> $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/pg_hba.conf
+
+# CommonMap customisation - allows an application tier to connect remotely
+#  over the semi-trusted AWS internal network.
+host    all             all             192.168.0.0/16          md5
+host    all             all             172.16/12               md5
+host    all             all             10.0.0.0/8              md5
+
+# CommonMap customisation - allows a database administrator to connect remotely
+#  over the untrusted internet; SSL is required.
+hostssl all             all             0.0.0.0/0               md5
+
+EOL
+
+
+# Restart database service to pick up new settings
+service postgresql-$PGSQL_SERVICE_SUFFIX restart
+
+
+
+## Set up Sysadmin support
+
+echo "## Set up Sysadmin support" 
+date 
+
+
+# Allow Webmin to access this database
+
+yum -y install perl-DBD-Pg
+
+
+# Add an hourly task to process bulk imports
+ln -s /mnt/scripts/$CM_ENV/4a.cm-psql-copy-files-to-osm-api.bash /etc/cron.hourly/order.10.psql-copy-files-to-osm-api
+
+
+
+mail -s "[commonmap-bots] db-core.$CM_ENV.commonmap.org is built" root@commonmap.info < /mnt/instance/meta-data.log
+  
+#### Established db-core service
+echo "####" 
+echo "#### Established db-core service" 
+echo "####" 
+date 
+
+
+# ENDS.

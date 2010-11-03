@@ -1,0 +1,635 @@
+#!/bin/bash
+#
+# A Script to build the base RightScale CentOS 5.4 Amazon Machine Image 
+#       ami-f8b35e91 (32 bit)
+#     or
+#       ami-ccb35ea5 (64 bit)
+#   Modified by the base rebuild script
+#       rc.dynamic.rebuild.local
+#     or
+#       rc.dynamic.rebuild.x64.local
+#   And able to connect to a database instance prepared by
+#     rc.dynamic.rebuild.db-core.local
+#   Into an "api" server for CommonMap purposes
+#       http://commonmap.info/w/index.php/Server/Setup/Demonstration/AWS
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+# Variables
+
+# Take common variables from included bash scripts
+DIR="$( cd "$( dirname "$0" )" && pwd )"
+source $DIR/rc.dynamic.environment.inc.sh
+source $DIR/../local/secrets.$CM_ENV.inc.sh
+source $DIR/../local/settings.$CM_ENV.inc.sh
+
+CM_RAILS_APP_ROOT=/var/www/commonmap/rails/rails
+
+PGSQL_SERVICE_HOST=db-core.private.$CM_ENV.commonmap.org
+PGSQL_SERVICE_PORT=5432                  # osmosis only supports port 5432
+
+
+if [ $( arch ) = 'x86_64' ]; then
+  EC2_ARCH=x86_64
+else
+  EC2_ARCH=i386
+fi
+
+
+#### Establish api service
+echo "####" 
+echo "#### Establish api service" 
+echo "####" 
+date 
+ 
+
+# Create and attach EBS volume.  Method inspired by:
+# http://alestic.com/2010/02/ec2-resize-running-ebs-root
+EBS_VOLUME_ID=$(ec2-create-volume --availability-zone $EC2_AVAILABILITY_ZONE --size $EBS_SIZE_GB_API -K $EC2_PRIVATE_KEY -C $EC2_CERT | cut -f2)
+echo "New EBS volume created.  ID: $EBS_VOLUME_ID"
+
+# Volume creation takes a little time so we have to try repeatedly
+SELF_EC2_INSTANCE_ID=`curl http://169.254.169.254/latest/meta-data/instance-id` 
+ec2-attach-volume --instance $SELF_EC2_INSTANCE_ID --device $EBS_DEVICE_PATH_API $EBS_VOLUME_ID -K $EC2_PRIVATE_KEY -C $EC2_CERT
+while ! ec2-describe-volumes $EBS_VOLUME_ID -K $EC2_PRIVATE_KEY -C $EC2_CERT | grep -q attached; do sleep 1; done
+echo "New EBS volume $EBS_VOLUME_ID attached to this EC2 instance $SELF_EC2_INSTANCE_ID as $EBS_DEVICE_PATH_API"
+
+# Initialise the filesystem
+mkfs.ext3 -F -L $EBS_EXT3_LABEL_API $EBS_DEVICE_PATH_API
+
+# Mount it
+mkdir -p /mnt/$EBS_MOUNT_LOCATION_API 
+mount $EBS_DEVICE_PATH_API /mnt/$EBS_MOUNT_LOCATION_API 
+
+
+# New binaries directory for api
+mkdir -p /mnt/$EBS_MOUNT_LOCATION_API/osm/rails_port
+mkdir -p /var/www/commonmap
+ln -s /mnt/$EBS_MOUNT_LOCATION_API/osm/rails_port /var/www/commonmap/rails
+
+
+# Copy api code from git repository
+echo "## Copy api code from git repository" 
+date
+ 
+cd /var/www/commonmap
+
+# As of April 2010, rails_port is now hosted by git
+#svn checkout http://svn.openstreetmap.org/sites/rails_port rails/rails
+#git clone git://git.openstreetmap.org/rails.git rails/rails
+git clone git://github.com/morb-au/CommonMap-API---Rails---experimental.git rails/rails
+
+cd /var/www/commonmap/rails/rails
+# This git commit breaks rails 1.8.5, and therefore CentOS 5.4 x86_64:
+#   http://git.openstreetmap.org/?p=rails.git;a=commit;h=94f19ce3b32d70c499893f8ffb9592a9f0a54f7a
+# Roll back to the previous commit.
+#git checkout 30ae9fb928abd1b2a30f5b1c0253bc195ffff14d
+git checkout -b CommonMap-on-CentOS-5.4 remotes/origin/CommonMap-on-CentOS-5.4
+#git checkout 5b2b129231c4339c1f10bfb461916611aefe06a0
+
+
+# Bind to postgres
+echo "## Bind to postgres" 
+date
+
+cd $CM_RAILS_APP_ROOT/config
+cat <<EOL > $CM_RAILS_APP_ROOT/config/database.yml
+
+development:
+  adapter: postgresql
+  database: commonmap_dv
+  username: commonmap_dv
+  password: $DATABASE_PASSWORD_DEVELOPMENT
+  host: $PGSQL_SERVICE_HOST
+  port: $PGSQL_SERVICE_PORT
+  encoding: utf8
+
+# Warning: The database defined as 'test' will be erased and
+# re-generated from your development database when you run 'rake'.
+# Do not set this db to the same as development or production.
+test:
+  adapter: postgresql
+  database: commonmap_ts
+  username: commonmap_ts
+  password: $DATABASE_PASSWORD_TEST
+  host: $PGSQL_SERVICE_HOST
+  port: $PGSQL_SERVICE_PORT
+  encoding: utf8
+
+production:
+  adapter: postgresql
+  database: commonmap_pr
+  username: commonmap_pr
+  password: $DATABASE_PASSWORD_PRODUCTION
+  host: $PGSQL_SERVICE_HOST
+  port: $PGSQL_SERVICE_PORT
+  encoding: utf8
+
+EOL
+
+# Create our rails application.yml
+echo "## Create our rails application.yml" 
+date
+
+cat <<EOL > $CM_RAILS_APP_ROOT/config/application.yml
+
+standard_settings: &standard_settings
+  # The server URL
+  server_url: "api.$CM_ENV.commonmap.org"
+  # The generator
+  generator: "CommonMap server"
+  # Sender addresses for emails
+  email_from: "CommonMap $CM_ENV <webmaster@commonmap.org>"
+  email_return_path: "bounces@commonmap.org"
+  # API version
+  api_version: "0.6"
+  # Application status - posstible values are:
+  #   :online - online and operating normally
+  #   :api_readonly - site online but API in read-only mode
+  #   :api_offline - site online but API offline
+  #   :database_readonly - database and site in read-only mode
+  #   :database_offline - database offline with site in emergency mode
+  #   :gpx_offline - gpx storage offline
+  status: :online
+  # The maximum area you're allowed to request, in square degrees
+  max_request_area: 0.25
+  # Number of GPS trace/trackpoints returned per-page
+  tracepoints_per_page: 5000
+  # Maximum number of nodes that will be returned by the api in a map request
+  max_number_of_nodes: 50000
+  # Maximum number of nodes that can be in a way (checked on save)
+  max_number_of_way_nodes: 2000
+  # Zoom level to use for postcode results from the geocoder
+  postcode_zoom: 15
+  # Zoom level to use for geonames results from the geocoder
+  geonames_zoom: 12
+  # Timeout for API calls in seconds
+  api_timeout: 300
+  # Timeout for web pages in seconds
+  web_timeout: 30
+  # Periods (in hours) which are allowed for user blocks
+  user_block_periods: [0, 1, 3, 6, 12, 24, 48, 96]
+  # Rate limit for message sending
+  max_messages_per_hour: 60
+  # Domain for handling message replies
+  #messages_domain: "messages.commonmap.org"
+  # Quova authentication details
+  #quova_username: ""
+  #quova_password: ""
+  # Spam threshold
+  spam_threshold: 50
+  # Default legale (jurisdiction location) for contributor terms
+  default_legale: AU
+  # Memory limits (in Mb)
+  #soft_memory_limit: 512
+  #hard_memory_limit: 2048
+  # Location of GPX traces and images
+  gpx_trace_dir: "/home/osm/traces"
+  gpx_image_dir: "/home/osm/images"
+  # Location of data for file columns
+  #file_column_root: ""
+
+development:
+  <<: *standard_settings
+
+production:
+  <<: *standard_settings
+
+test:
+  <<: *standard_settings
+
+EOL
+
+
+## Reinstall libxml-ruby from its first mention in
+## rc.dynamic.rebuild.x64.local
+## otherwise we seem to get the error
+## "/usr/lib64/ruby/gems/1.8/gems/libxml-ruby-1.1.4/lib/libxml_ruby.so: invalid ELF header - /usr/lib64/ruby/gems/1.8/gems/libxml-ruby-1.1.4/lib/libxml_ruby.so"
+echo "# Reinstall libxml-ruby " 
+date
+
+gem install --no-ri --no-rdoc libxml-ruby
+
+
+# Create initial database schemas 
+#  (but use rake gems:install first to getting the missing 
+#   SystemTimer  >= 1.1.3 gem)
+echo "## Create initial database schemas" 
+date
+
+cd $CM_RAILS_APP_ROOT
+#gem install --no-ri --no-rdoc sanitize --version=
+yum -y install libxslt-devel 
+rake gems:install
+
+##
+## TODO: Stall until postgresql server is up.
+## Right now it is pure luck that it takes longer to
+## run this script up to here 
+## compared to running the whole of
+## rc.dynamic.rebuild.db-core.local
+## if both are started on similarly specified servers
+## and this script is started second.
+##
+
+echo "# rake db:migrate for development environment" 
+date
+rake db:migrate
+
+echo "# rake db:migrate for test environment" 
+date
+env RAILS_ENV=test rake db:migrate
+
+echo "# rake db:migrate for production environment" 
+date
+env RAILS_ENV=production rake db:migrate 
+
+
+## Bind rails application to mod_rails and apache httpd
+echo "## Bind rails application to mod_rails and apache httpd" 
+date
+
+# Bind to mod_rails
+
+case $EC2_ARCH in
+i386)
+
+cat <<EOL > /etc/httpd/conf.d/rails.conf
+
+# This configuration is as recommended by passenger-install-apache2-module
+
+LoadModule passenger_module /usr/lib/ruby/gems/1.8/gems/passenger-2.2.15/ext/apache2/mod_passenger.so
+PassengerRoot /usr/lib/ruby/gems/1.8/gems/passenger-2.2.15
+PassengerRuby /usr/bin/ruby
+
+# PoolSize should be matched to the memory of the target machine
+# (256M free memory per instance)
+PassengerMaxPoolSize 6
+PassengerUseGlobalQueue on
+
+EOL
+
+;;
+x86_64)
+
+cat <<EOL > /etc/httpd/conf.d/rails.conf
+
+# This configuration is as recommended by passenger-install-apache2-module
+
+LoadModule passenger_module /usr/lib64/ruby/gems/1.8/gems/passenger-2.2.15/ext/apache2/mod_passenger.so
+PassengerRoot /usr/lib64/ruby/gems/1.8/gems/passenger-2.2.15
+PassengerRuby /usr/bin/ruby
+
+EOL
+
+;;
+esac
+
+### TODO: Do we need to fix the version number of passenger?  Seems to be fast moving.
+
+
+# Bind to apache httpd
+
+cat <<EOL > /etc/httpd/conf.d/commonmap.conf
+
+# This configuration is as recommended by passenger-install-apache2-module
+
+# Turn name-based virtual hosts ON.
+
+NameVirtualHost *:80
+
+ <VirtualHost *:80>
+    ServerName api.$CM_ENV.commonmap.org
+    DocumentRoot $CM_RAILS_APP_ROOT/public
+    <Directory $CM_RAILS_APP_ROOT/public>
+       AllowOverride all
+       Options -MultiViews
+    </Directory>
+    <Location /munin/>
+      PassengerEnabled off
+    </Location>
+    <Location /planet/>
+      PassengerEnabled off
+    </Location>
+    <Location /tile/>
+      PassengerEnabled off
+    </Location>
+  </VirtualHost>
+
+EOL
+
+# Adjust timeout on httpd server to 5 minutes
+# - avoid changeset uploads from timing out
+cp /etc/httpd/conf/httpd.conf /etc/httpd/conf/httpd.conf.orig
+sed -i "s/Timeout 120/Timeout 300/g" /etc/httpd/conf/httpd.conf
+
+
+## Bind API reference map to tile server
+echo "## Bind API reference map to tile server" 
+date
+sed -i "s/api\.production\.commonmap\.org/api.$CM_ENV.commonmap.org/g" $CM_RAILS_APP_ROOT/public/openlayers/OpenStreetMap.js
+sed -i "s/tile\.production\.commonmap\.org/tile.$CM_ENV.commonmap.org/g" $CM_RAILS_APP_ROOT/public/openlayers/OpenStreetMap.js
+sed -i "s/tile\\\.production\\\.commonmap\\\.org/tile\.$CM_ENV\.commonmap\.org/g" $CM_RAILS_APP_ROOT/public/openlayers/OpenStreetMap.js
+
+
+## Bind API website URLs to its home server
+echo "## Bind API website URLs to its home server" 
+date
+sed -i "s/api\.production\.commonmap\.org/api.$CM_ENV.commonmap.org/g" $CM_RAILS_APP_ROOT/app/controllers/api_controller.rb
+sed -i "s/api\.production\.commonmap\.org/api.$CM_ENV.commonmap.org/g" $CM_RAILS_APP_ROOT/app/controllers/export_controller.rb
+sed -i "s/api\.production\.commonmap\.org/api.$CM_ENV.commonmap.org/g" $CM_RAILS_APP_ROOT/app/views/diary_entry/rss.rss.builder
+sed -i "s/api\.production\.commonmap\.org/api.$CM_ENV.commonmap.org/g" $CM_RAILS_APP_ROOT/config/environment.rb
+
+
+## Customisations to website content
+echo "## Customisations to website content" 
+date
+
+### TODO: Customisations to website content
+### TODO: Customisations to website content
+### TODO: Customisations to website content
+
+# Logo Rebranding
+cp /mnt/scripts/$CM_ENV/website/commonmap-logo.png $CM_RAILS_APP_ROOT/public/images
+chmod 0644 $CM_RAILS_APP_ROOT/public/images/commonmap-logo.png
+
+sed -i 's/www\.openstreetmap\.org/api.$CM_ENV.commonmap.org/g' $CM_RAILS_APP_ROOT/public/403.html
+sed -i 's/www\.openstreetmap\.org/api.$CM_ENV.commonmap.org/g' $CM_RAILS_APP_ROOT/public/404.html
+sed -i 's/www\.openstreetmap\.org/api.$CM_ENV.commonmap.org/g' $CM_RAILS_APP_ROOT/public/500.html
+sed -i 's/osm_logo\.png/commonmap-logo.png/g' $CM_RAILS_APP_ROOT/public/403.html
+sed -i 's/osm_logo\.png/commonmap-logo.png/g' $CM_RAILS_APP_ROOT/public/404.html
+sed -i 's/osm_logo\.png/commonmap-logo.png/g' $CM_RAILS_APP_ROOT/public/500.html
+
+sed -i 's/osm_logo\.png/commonmap-logo.png/g' $CM_RAILS_APP_ROOT/app/views/layouts/site.html.erb
+
+
+# Text Rebranding
+#grep -rl openstreetmap\.org $CM_RAILS_APP_ROOT | xargs sed -i 's/openstreetmap\.org/commmonmap\.org/g'
+#grep -rl OpenStreetMap $CM_RAILS_APP_ROOT | xargs sed -i 's/OpenStreetMap/CommonMap/g'
+
+sed -i 's/OpenStreetMap/CommonMap/g' $CM_RAILS_APP_ROOT/app/controllers/api_controller.rb
+
+sed -i 's/OpenStreetMap/CommonMap/g' $CM_RAILS_APP_ROOT/app/views/api/map.xml.builder
+sed -i 's/OpenStreetMap/CommonMap/g' $CM_RAILS_APP_ROOT/app/views/diary_entry/rss.rss.builder
+
+sed -i 's/OpenStreetMap/CommonMap/g' $CM_RAILS_APP_ROOT/config/environment.rb
+
+sed -i 's/OpenStreetMap/CommonMap/g' $CM_RAILS_APP_ROOT/doc/README_FOR_APP
+sed -i 's/OpenStreetMap/CommonMap/g' $CM_RAILS_APP_ROOT/lib/osm.rb
+sed -i 's/OpenStreetMap/CommonMap/g' $CM_RAILS_APP_ROOT/public/stylesheets/common.css
+
+
+
+grep -rl OpenStreetMap $CM_RAILS_APP_ROOT/config/locales/*.yml | xargs sed -i 's/OpenStreetMap/CommonMap/g'
+grep -rl OpenStreetMap $CM_RAILS_APP_ROOT/config/potlatch/locales/*.yml | xargs sed -i 's/OpenStreetMap/CommonMap/g'
+
+
+### TODO: Customisations to website content
+
+
+
+## Bind rails API to cache directory for config.action_controller.perform_caching
+echo "## Bind rails API to cache directory for config.action_controller.perform_caching" 
+date
+mkdir -p $CM_RAILS_APP_ROOT/tmp/cache
+chown -R apache:apache $CM_RAILS_APP_ROOT/tmp/cache
+
+
+## Install libpgosm - to install osmosis-based replication support
+echo "## Install libpgosm" 
+date
+
+# Add PostgreSQL 9.0 path for access to pg_config
+# Should have no side-effect for PostgreSQL 8.x-only systems
+PATH=/usr/pgsql-9.0/bin:$PATH
+
+cd $CM_RAILS_APP_ROOT/db/functions
+make libpgosm.so
+
+ldconfig -v
+
+# Note: don't put the following file in 
+#  /mnt/scripts/$CM_ENV/
+#  As the postgres user won't be able
+#  to access it later on.
+cat <<EOL > /mnt/scripts/temp.install.xid_to_int4.sql
+
+ CREATE FUNCTION xid_to_int4(xid) RETURNS int4
+  AS '$CM_RAILS_APP_ROOT/db/functions/libpgosm', 'xid_to_int4'
+  LANGUAGE C IMMUTABLE STRICT;
+
+EOL
+
+
+# Set up password for access to the cm-core database
+echo "$PGSQL_SERVICE_HOST:$PGSQL_SERVICE_PORT:commonmap_dv:commonmap_dv:$DATABASE_PASSWORD_DEVELOPMENT" >> ~postgres/.pgpass
+echo "$PGSQL_SERVICE_HOST:$PGSQL_SERVICE_PORT:commonmap_ts:commonmap_ts:$DATABASE_PASSWORD_TEST" >> ~postgres/.pgpass
+echo "$PGSQL_SERVICE_HOST:$PGSQL_SERVICE_PORT:commonmap_pr:commonmap_pr:$DATABASE_PASSWORD_PRODUCTION" >> ~postgres/.pgpass
+chown postgres:postgres ~postgres/.pgpass
+chmod 0600 ~postgres/.pgpass
+
+echo "# Running: psql --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT -d commonmap_dv -U commonmap_dv < /mnt/scripts/temp.install.xid_to_int4.sql" 
+su - postgres -c "psql --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT -d commonmap_dv -U commonmap_dv < /mnt/scripts/temp.install.xid_to_int4.sql"
+
+echo "# Running: psql --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT -d commonmap_ts -U commonmap_ts < /mnt/scripts/temp.install.xid_to_int4.sql" 
+su - postgres -c "psql --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT -d commonmap_ts -U commonmap_ts < /mnt/scripts/temp.install.xid_to_int4.sql"
+
+echo "# Running: psql --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT -d commonmap_pr -U commonmap_pr < /mnt/scripts/temp.install.xid_to_int4.sql" 
+su - postgres -c "psql --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT -d commonmap_pr -U commonmap_pr < /mnt/scripts/temp.install.xid_to_int4.sql" 
+
+
+## Set up libmemcached for the GPX importer
+echo "## Set up libmemcached for the GPX importer" 
+date
+
+cd ~/download
+wget -c http://rpms.famillecollet.com/enterprise/5/remi/$EC2_ARCH/libmemcached-0.44-1.el5.remi.$EC2_ARCH.rpm
+wget -c http://rpms.famillecollet.com/enterprise/5/remi/$EC2_ARCH/libmemcached-devel-0.44-1.el5.remi.$EC2_ARCH.rpm
+
+rpm -ivh libmemcached-0.44-1.el5.remi.i386.rpm
+rpm -ivh libmemcached-devel-0.44-1.el5.remi.i386.rpm
+
+
+## Set up libarchive for the GPX importer
+echo "## Set up libarchive for the GPX importer" 
+date
+
+cd ~/download
+wget -c http://libarchive.googlecode.com/files/libarchive-2.8.4.tar.gz
+tar -zxvf libarchive-2.8.4.tar.gz
+cd ~/download/libarchive-2.8.4
+
+./configure
+make
+make install
+
+
+# bring libarchive to the attention of ldconfig
+echo "# bring libarchive to the attention of ldconfig" 
+date 
+ 
+case $EC2_ARCH in
+i386)
+echo "/usr/local/lib" >> /etc/ld.so.conf.d/libarchive-local-libs.conf 
+;;
+x86_64)
+echo "/usr/local/lib64" >> /etc/ld.so.conf.d/libarchive-local-libs.conf
+;;
+esac
+ldconfig -v
+
+# Add PostgreSQL 9.0 path for access to pg_config
+# Should have no side-effect for PostgreSQL 8.x-only systems
+PATH=/usr/pgsql-9.0/bin:$PATH
+
+# Add GPX destination directories
+mkdir -p /home/osm/traces
+mkdir -p /home/osm/images
+chown -R apache:apache /home/osm/
+
+
+## Set up GPX importer
+echo "## Set up GPX importer" 
+date
+
+yum -y install gd-devel
+
+
+mkdir -p ~/download/svn
+cd ~/download/svn
+svn checkout http://svn.openstreetmap.org/applications/utils/gps-tracks/gpx-import gpx-import
+cd ~/download/svn/gpx-import/
+
+
+sed -i "s/www\.openstreetmap\.org/api.$CM_ENV.commonmap.org/g" ~/download/svn/gpx-import/src/interpolate.c
+
+
+## Adjust the gpx-import Makefile such that it makes with full debug-level logging.
+#sed -i 's/CFLAGS += -DNDEBUG/#CFLAGS += -DNDEBUG/g' ~/download/svn/gpx-import/src/Makefile
+
+
+# The following adjusts cache targets - 
+# gpx-import is geared towards memcached
+# but our rails code is actually geared towards
+# a file_store cache store (see config/environment.rb).
+# The following is a nasty
+# hack to bridge the 2 paradigms.
+
+# Note use of alternate sed regexp delimiter (@) here so that we don't have to
+#  escape CM_RAILS_APP_ROOT.
+sed -i "s@views/www\.openstreetmap\.org@rm $CM_RAILS_APP_ROOT/tmp/cache/views/api.$CM_ENV.commonmap.org@g" ~/download/svn/gpx-import/src/main.c
+
+# For each 'cache_delete', append each path with a '/*':
+sed -i 's/cache_delete("\(.*\)"\(.*\)/cache_delete("\1\/*"\2/g' ~/download/svn/gpx-import/src/main.c
+
+# Ignore the fact we don't have a memcached;
+sed -i '78s/ptr/1/g' ~/download/svn/gpx-import/src/cache.c
+
+# Flatten the locale for-loop: 'rm -rf' will delete all those files anyway
+sed -i '89s/for/if/g' ~/download/svn/gpx-import/src/cache.c
+sed -i '89s/const char \*\*localep = locales; \*localep; localep++/1/g' ~/download/svn/gpx-import/src/cache.c
+
+# delete this line in cache.c: snprintf(key + keylen, 18, "?locale=%s", *localep);
+sed -i '91s/.*//g' ~/download/svn/gpx-import/src/cache.c
+
+# replace the memcached removal with the file_store removal:
+sed -i 's/memcached_delete(ptr, key, strlen(key), 0)/system(key)/g' ~/download/svn/gpx-import/src/cache.c
+
+
+# now make our hacked up gps-importer!
+make DB=postgres -C src
+
+
+## Bind gpx importer to database
+echo "## Bind gpx importer to database" 
+date
+
+cd ~/download/svn/gpx-import/
+sed -i "s/setting PGSQL_HOST localhost/setting PGSQL_HOST $PGSQL_SERVICE_HOST/g" ~/download/svn/gpx-import/settings.sh
+sed -i "s/#setting PGSQL_USER openstreetmap/setting PGSQL_USER commonmap_pr/g" ~/download/svn/gpx-import/settings.sh
+sed -i "s/setting PGSQL_DB openstreetmap/setting PGSQL_DB commonmap_pr/g" ~/download/svn/gpx-import/settings.sh
+sed -i "s/#setting PGSQL_PASS openstreetmap/setting PGSQL_PASS $DATABASE_PASSWORD_PRODUCTION/g" ~/download/svn/gpx-import/settings.sh
+
+
+## Rebrand gpx importer email templates
+echo "## Rebrand gpx importer email templates" 
+date
+
+cd ~/download/svn/gpx-import/
+sed -i "s/From: webmaster@openstreetmap.org/From: CommonMap $CM_ENV <webmaster@commonmap.org>/g" ~/download/svn/gpx-import/templates/import-ok.eml
+sed -i "s/\[OpenStreetMap\]/\[CommonMap\]/g" ~/download/svn/gpx-import/templates/import-ok.eml
+
+sed -i "s/From: webmaster@openstreetmap.org/From: CommonMap $CM_ENV <webmaster@commonmap.org>/g" ~/download/svn/gpx-import/templates/import-bad.eml
+sed -i "s/\[OpenStreetMap\]/\[CommonMap\]/g" ~/download/svn/gpx-import/templates/import-bad.eml
+sed -i "s/http:\/\/wiki.openstreetmap.org\/index.php\/GPX_Import_Failures/http:\/\/www.commonmap.org\/wiki\/gpx-import-failures/g" ~/download/svn/gpx-import/templates/import-bad.eml
+
+
+#####
+#####
+
+## Start up gpx importer
+## TODO: Move this into init.d auto startup
+echo "## Start up gpx importer" 
+date
+ldconfig
+cd ~/download/svn/gpx-import/
+./settings.sh start src/gpx-import
+
+
+## Final configuration and bringup
+echo "## Final configuration and bringup" 
+date
+
+# Assign file permissions to webserver
+
+#cd $CM_RAILS_APP_ROOT
+#chown -R apache:apache * 
+#chown -R apache:apache /var/www/commonmap/rails 
+chown -R apache:apache $CM_RAILS_APP_ROOT
+chown -R apache:apache /mnt/$EBS_MOUNT_LOCATION_API/osm
+
+
+# Add an apache httpd MIME type directive to keep
+#  Potlatch2 + Adobe Flash's sandbox rules happy.
+cp /mnt/scripts/$CM_ENV/flash_crossdomain.conf /etc/httpd/conf.d/ 
+
+
+# Bounce the webserver
+
+service httpd restart
+
+
+
+mail -s "[commonmap-bots] api.$CM_ENV.commonmap.org is built" root@commonmap.info < /mnt/instance/meta-data.log
+ 
+  
+#### Established api service
+echo "####" 
+echo "#### Established api service" 
+echo "####" 
+date 
+
+
+# ENDS.

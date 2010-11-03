@@ -1,0 +1,104 @@
+#!/bin/bash
+#
+# A Script to convert from Planet XML format to the Tile Rendering database
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+# Variables
+
+# Take common variables from included bash scripts
+DIR=/mnt/scripts/local
+source $DIR/rc.dynamic.environment.inc.sh
+
+PGSQL_SERVICE_PORT=5434
+
+#### Convert from Planet File to Tile Database
+echo "####" 
+echo "#### Convert from Planet File to Tile Database" 
+echo "####" 
+date 
+
+## Serialise execution of this script
+ 
+LOCKFILE=/tmp/rc.dynamic.planet2db-tile.local.lock
+ 
+if [ -f $LOCKFILE ]; then
+  if [ "$(ps -p `cat $LOCKFILE` | wc -l)" -gt 1 ]; then
+    # process is still running
+    echo "Locked"
+    exit 1
+  else
+    # process not running, but lock file not deleted?
+    echo "WARNING: Previous execution did not run to completion"
+    rm $LOCKFILE
+  fi
+fi
+echo $$ > $LOCKFILE
+
+
+## Import
+
+TIMESTAMP=`date -u +%Y-%m-%d-%H-%M`
+ 
+ 
+## Do the planet import
+#
+#su - postgres -c "nice osm2pgsql -P $PGSQL_SERVICE_PORT -d mod_tile_pr --slim /var/www/commonmap/planet/public/commonmap.planet.earth.latest.osm"
+
+
+## Do the osmosis replication import
+
+mkdir -p /mnt/db-tile-incoming-xml-change
+
+nice /root/download/svn/osmosis/bin/osmosis --read-replication-interval workingDirectory=/mnt/db-tile-incoming-osmosis-replication --write-xml-change /mnt/db-tile-incoming-xml-change/osm2pgsql.$TIMESTAMP.osc
+
+su - postgres -c "osm2pgsql -a -P $PGSQL_SERVICE_PORT -d mod_tile_pr --slim /mnt/db-tile-incoming-xml-change/osm2pgsql.$TIMESTAMP.osc"
+
+
+
+# Let mod_tile know there's an update
+## FIXME: This only has an affect if the mod_tile is on the same
+## machine ('db-tile' and 'tile' roles are co-located).
+## TODO.
+
+#touch /var/lib/mod_tile/planet-import-complete
+
+# New method.
+# amazon.aws.inter-server.pem must be the private key file
+# generated with an EC2 "Create Key Pair" command.
+#ssh -i /mnt/scripts/local/amazon.aws.inter-server.$CM_ENV.pem -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no tile.private.$CM_ENV.commonmap.org 'touch /var/lib/mod_tile/planet-import-complete'
+ssh -i /mnt/scripts/local/amazon.aws.inter-server.$CM_ENV_SDLC.pem -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no tile.private.$CM_ENV.commonmap.org 'touch /var/lib/mod_tile/planet-import-complete'
+
+
+## End of serialised section 
+rm $LOCKFILE
+
+#### Converted from Planet File to Tile Database
+echo "####" 
+echo "#### Converted from Planet File to Tile Database" 
+echo "####" 
+date 
+
+# ENDS.

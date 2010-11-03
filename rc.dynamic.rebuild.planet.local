@@ -1,0 +1,266 @@
+#!/bin/bash
+#
+# A Script to build the base RightScale CentOS 5.4 Amazon Machine Image 
+#       ami-f8b35e91 (32 bit)
+#     or
+#       ami-ccb35ea5 (64 bit)
+#   Modified by the base rebuild script
+#       rc.dynamic.rebuild.local
+#     or
+#       rc.dynamic.rebuild.x64.local
+#   And able to connect to a database instance prepared by
+#     rc.dynamic.rebuild.db-core.local
+# Into a "planet" server for CommonMap purposes
+#   http://commonmap.info/w/index.php/Server/Setup/Demonstration/AWS
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+# Variables
+
+# Take common variables from included bash scripts
+DIR="$( cd "$( dirname "$0" )" && pwd )"
+source $DIR/rc.dynamic.environment.inc.sh
+source $DIR/../local/secrets.$CM_ENV.inc.sh
+source $DIR/../local/settings.$CM_ENV.inc.sh
+
+PGSQL_SERVICE_HOST=db-core.private.$CM_ENV.commonmap.org
+PGSQL_SERVICE_PORT=5432                  # osmosis only supports port 5432
+
+
+#### Establish planet service
+echo "####" 
+echo "#### Establish planet service" 
+echo "####" 
+date 
+
+
+# Create and attach EBS volume.  Method inspired by:
+# http://alestic.com/2010/02/ec2-resize-running-ebs-root
+EBS_VOLUME_ID=$(ec2-create-volume --availability-zone $EC2_AVAILABILITY_ZONE --size $EBS_SIZE_GB_PLANET -K $EC2_PRIVATE_KEY -C $EC2_CERT | cut -f2)
+echo "New EBS volume created.  ID: $EBS_VOLUME_ID"
+
+# Volume creation takes a little time so we have to try repeatedly
+SELF_EC2_INSTANCE_ID=`curl http://169.254.169.254/latest/meta-data/instance-id` 
+ec2-attach-volume --instance $SELF_EC2_INSTANCE_ID --device $EBS_DEVICE_PATH_PLANET $EBS_VOLUME_ID -K $EC2_PRIVATE_KEY -C $EC2_CERT
+while ! ec2-describe-volumes $EBS_VOLUME_ID -K $EC2_PRIVATE_KEY -C $EC2_CERT | grep -q attached; do sleep 1; done
+echo "New EBS volume $EBS_VOLUME_ID attached to this EC2 instance $SELF_EC2_INSTANCE_ID as $EBS_DEVICE_PATH_PLANET"
+
+# Initialise the filesystem
+mkfs.ext3 -F -L $EBS_EXT3_LABEL $EBS_DEVICE_PATH_PLANET
+
+echo "# Mounting new filesystem..." 
+date
+ 
+# Mount it
+mkdir -p /mnt/$EBS_MOUNT_LOCATION_PLANET
+mount $EBS_DEVICE_PATH_PLANET /mnt/$EBS_MOUNT_LOCATION_PLANET 
+
+echo "# Mounted..." 
+date
+
+ 
+# New data directory for planets
+mkdir -p /mnt/$EBS_MOUNT_LOCATION_PLANET/public
+mkdir -p /var/www/commonmap/planet
+ln -s /mnt/$EBS_MOUNT_LOCATION_PLANET/public /var/www/commonmap/planet/public
+
+
+# Create directory
+
+#mkdir -p /var/www/commonmap/planet/public
+chown -R apache:apache /var/www/commonmap/planet/public
+chown -R apache:apache /mnt/$EBS_MOUNT_LOCATION_PLANET
+
+
+# Bind to apache httpd
+echo "# Bind to apache httpd" 
+date 
+
+cat <<EOL > /etc/httpd/conf.d/planet.conf
+
+# Turn name-based virtual hosts ON.
+
+NameVirtualHost *:80
+
+  <VirtualHost *:80>
+     ServerName planet.$CM_ENV.commonmap.org
+     DocumentRoot /var/www/commonmap/planet/public
+     <Directory /var/www/commonmap/planet/public>
+        Options Indexes FollowSymLinks
+        AllowOverride None
+     </Directory>
+  </VirtualHost>
+
+EOL
+
+# Remove the default welcome page - go straight to planet files listing
+mv /etc/httpd/conf.d/welcome.conf /etc/httpd/conf.d/welcome.conf.disable 
+
+
+## Install Osmosis
+echo "## Install Osmosis" 
+date 
+
+# Install dependencies
+
+yum -y install ant
+yum -y install ant-nodeps
+yum -y install junit
+yum -y install ant-junit 
+
+# Install osmosis itself
+echo "# Install osmosis itself" 
+date 
+
+mkdir -p ~/download/svn 
+cd ~/download/svn
+# SVN HEAD in c.September 2010 failed unit testing
+#svn checkout http://svn.openstreetmap.org/applications/utils/osmosis/trunk osmosis 
+svn checkout http://svn.openstreetmap.org/applications/utils/osmosis/branches/0.35-fixes osmosis 
+cd ~/download/svn/osmosis
+
+echo "# Apply last minute fixes that replace int4 with int8 latitudes and longitudes" 
+date
+sed -i 's/PRECISION = 7/PRECISION = 16/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/int MULTIPLICATION_FACTOR/long MULTIPLICATION_FACTOR/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/int result/long result/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/static int calculateMultiplicationFactor/static long calculateMultiplicationFactor/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/static int convertToFixed/static long convertToFixed/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/int coordinate/long coordinate/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/(int)/(long)/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+
+sed -i 's/getInt("latitude")/getLong("latitude")/g' src/org/openstreetmap/osmosis/core/apidb/v0_6/impl/NodeRowMapper.java 
+sed -i 's/getInt("longitude")/getLong("longitude")/g' src/org/openstreetmap/osmosis/core/apidb/v0_6/impl/NodeRowMapper.java 
+
+sed -i 's/sr.readInteger/sr.readLong/g' src/org/openstreetmap/osmosis/core/domain/v0_6/Node.java 
+sed -i 's/sw.writeInteger/sw.writeLong/g' src/org/openstreetmap/osmosis/core/domain/v0_6/Node.java 
+
+sed -i 's/sr.readInteger/sr.readLong/g' src/org/openstreetmap/osmosis/core/domain/v0_5/Node.java 
+sed -i 's/sw.writeInteger/sw.writeLong/g' src/org/openstreetmap/osmosis/core/domain/v0_5/Node.java 
+
+sed -i 's/0.#######/0.################/g' src/org/openstreetmap/osmosis/core/xml/v0_6/impl/NodeWriter.java 
+
+sed -i 's/setInt(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/setLong(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/g' src/org/openstreetmap/osmosis/core/apidb/v0_6/ApidbWriter.java 
+sed -i 's/setInt(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/setLong(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/g' src/org/openstreetmap/osmosis/core/apidb/v0_6/impl/ChangeWriter.java 
+
+sed -i 's/setInt(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/setLong(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/MysqlWriter.java 
+
+sed -i '248s/setInt/setLong/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/impl/ChangeWriter.java 
+sed -i '250s/setInt/setLong/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/impl/ChangeWriter.java 
+sed -i '285s/setInt/setLong/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/impl/ChangeWriter.java 
+sed -i '287s/setInt/setLong/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/impl/ChangeWriter.java 
+
+sed -i 's/writeInt(FixedPrecisionCoordinateConvertor.convertToFixed/writeLong(FixedPrecisionCoordinateConvertor.convertToFixed/g' src/org/openstreetmap/osmosis/core/pgsql/v0_6/impl/PersistentNodeLocationStore.java 
+
+cp -f /mnt/scripts/$CM_ENV/InMemoryNodeLocationStore.java src/org/openstreetmap/osmosis/core/pgsql/v0_6/impl/
+
+
+
+echo "# Run osmosis ant" 
+date 
+cd ~/download/svn/osmosis
+ant
+
+
+## Run the first osmosis replication
+# This establishes a baseline for replication.
+# We want to do this before the first planet
+# So that consumers of the planet+replicaton model
+# don't miss any changes that sneak in
+#  (i.e. avoid a race condition)
+echo "## Run the first osmosis replication" 
+date
+
+# Let the script know what environment it's in
+cp $DIR/rc.dynamic.environment.inc.sh $DIR/../local
+
+/mnt/scripts/$CM_ENV/rc.dynamic.db-core2replicate.local
+
+
+## Build first planet
+echo "## Build first planet" 
+date 
+ 
+
+# raw
+
+cd /var/www/commonmap/planet/public
+
+~/download/svn/osmosis/bin/osmosis --read-apidb-current dbType="postgresql" validateSchemaVersion="no" host="$PGSQL_SERVICE_HOST" database="commonmap_pr" user="commonmap_pr" password="$PGSQL_SERVICE_PASSWORD" --write-xml file="commonmap.planet.earth.latest.osm" 
+
+# gzip
+
+cd /var/www/commonmap/planet/public
+
+~/download/svn/osmosis/bin/osmosis --read-apidb-current dbType="postgresql" validateSchemaVersion="no" host="$PGSQL_SERVICE_HOST" database="commonmap_pr" user="commonmap_pr" password="$PGSQL_SERVICE_PASSWORD" --write-xml file="commonmap.planet.earth.latest.osm.gz" 
+
+# bzip2
+echo "# bzip2" 
+date 
+
+cd /var/www/commonmap/planet/public
+
+~/download/svn/osmosis/bin/osmosis --read-apidb-current dbType="postgresql" validateSchemaVersion="no" host="$PGSQL_SERVICE_HOST" database="commonmap_pr" user="commonmap_pr" password="$PGSQL_SERVICE_PASSWORD" --write-xml file="commonmap.planet.earth.latest.osm.bz2" 
+
+
+## Add cron tasks
+echo "## Add cron tasks" 
+date 
+
+# Let the cron jobs know what environment it's in
+cp $DIR/rc.dynamic.environment.inc.sh $DIR/../local
+
+# Add an hourly task to run the osmosis replicator
+ln -s /mnt/scripts/$CM_ENV/rc.dynamic.db-core2replicate.local /etc/cron.hourly/order.30.apidb-replicate
+
+# Add a daily task to rebuild the planet
+#ln -s /mnt/scripts/$CM_ENV/rc.dynamic.db-core2planet.local /etc/cron.daily/order.10.planet.rebuild
+# For Build Debugging Purposes, run this every hour.
+ln -s /mnt/scripts/$CM_ENV/rc.dynamic.db-core2planet.local /etc/cron.hourly/order.70.planet.rebuild
+
+# Add an daily task to compress the planet
+#ln -s /mnt/scripts/$CM_ENV/rc.dynamic.planet2planetz.local /etc/cron.daily/order.40.planetz.rebuild
+# For Build Debugging Purposes, run this every hour.
+ln -s /mnt/scripts/$CM_ENV/rc.dynamic.planet2planetz.local /etc/cron.hourly/order.80.planetz.rebuild
+
+
+## Final configuration and bringup
+echo "## Final configuration and bringup" 
+date 
+
+# Bounce the webserver
+
+service httpd restart
+
+mail -s "[commonmap-bots] planet.$CM_ENV.commonmap.org is built" root@commonmap.info < /mnt/instance/meta-data.log
+
+#### Established planet service
+echo "####" 
+echo "#### Established planet service" 
+echo "####" 
+date 
+
+
+# ENDS.

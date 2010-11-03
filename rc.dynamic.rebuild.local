@@ -1,0 +1,364 @@
+#!/bin/bash
+#
+# A Script to build the base RightScale CentOS 5.4 i386 or x86_64
+# Amazon Machine Image 
+#   ami-f8b35e91 (32 bit)
+#     or
+#   ami-ccb35ea5 (64 bit)
+# Into a base server for CommonMap purposes
+#   http://commonmap.info/w/index.php/Server/Setup/Demonstration/AWS
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+# Variables
+
+# Take common variables from included bash scripts
+DIR="$( cd "$( dirname "$0" )" && pwd )"
+source $DIR/rc.dynamic.environment.inc.sh 
+source $DIR/../local/secrets.$CM_ENV.inc.sh
+source $DIR/../local/settings.$CM_ENV.inc.sh
+
+#POSTGRES_VERSION=8.4.4
+#POSTGRES_RPM_NAME=postgresql
+#POSTGRES_RPM_VERSION=8.4.4-1PGDG
+#POSTGRES_CONFIG=/usr/local/bin/pg_config (probably)
+
+POSTGRES_VERSION=9.0.1
+POSTGRES_RPM_NAME=postgresql90
+POSTGRES_RPM_VERSION=9.0.1-1PGDG
+POSTGRES_CONFIG=/usr/pgsql-9.0/bin/pg_config
+
+if [ $( arch ) = 'x86_64' ]; then
+  EC2_ARCH=x86_64
+else
+  EC2_ARCH=i386
+fi
+
+ 
+echo "####" 
+echo "#### Starting rc.dynamic.rebuild.local"
+echo "####     on $EC2_ARCH machine architecture"
+echo "####" 
+date
+
+# Secure the secrets etc
+chmod -R 700 $DIR/../*
+
+# Set local time
+mv /etc/localtime /etc/localtime.orig
+ln -s /usr/share/zoneinfo/$TIMEZONE_PATH /etc/localtime
+TZ_PATH=$(readlink /etc/localtime)
+
+echo "# Changed localtime to $TZ_PATH"
+date
+
+
+## Set up rc.local so that a CM_ENV subdomain
+## can access the scripts in its subdomain
+## even after reboot
+
+echo "# CM_ENV = $CM_ENV"
+echo "# CM_ENV_SDLC = $CM_ENV_SDLC"
+
+if [ "$CM_ENV" != "$CM_ENV_SDLC" ]; then
+  sed -i "s/CM_ENV=$CM_ENV_SDLC/CM_ENV=$CM_ENV/g" /etc/rc.local
+  echo "# Pointed rc.local from $CM_ENV_SDLC to $CM_ENV"
+else  
+  echo "# The subdomain is the same as the SDLC; no rc.local changes required"
+fi
+
+
+## Install and fork off rc.dynamic.local
+## for first time.
+echo "## Install and fork off rc.dynamic.local"
+
+cp /mnt/scripts/$CM_ENV/rc.dynamic.local.staging /mnt/scripts/$CM_ENV/rc.dynamic.local
+/mnt/scripts/$CM_ENV/rc.dynamic.local &
+
+
+## Install WebMin
+echo "## Install WebMin"
+date
+
+cd ~
+mkdir download
+cd ~/download
+wget -c http://prdownloads.sourceforge.net/webadmin/webmin-1.500-1.noarch.rpm
+rpm -ivh webmin-1.500-1.noarch.rpm
+/usr/libexec/webmin/changepass.pl /etc/webmin root $PASSWORD_ROOT
+service webmin start
+
+# Install libraries for WebMin SSL mode
+
+yum -y install perl-Net-SSLeay
+
+### TODO: Programmatically change the following settings in WebMin GUI:
+## Webmin > Webmin Configuration.
+## On the right hand side, select SSL Encryption.
+## Change Enable SSL if available from No to Yes.
+## Change Redirect non-SSL requests to SSL mode from No to Yes. 
+
+
+## Install Munin
+echo "## Install Munin"
+date
+
+# Install the Dag Wieers YUM Repository
+
+case $EC2_ARCH in
+i386)
+
+cat <<EOL > /etc/yum.repos.d/dag.repo 
+
+[dag]
+name=Dag RPM Repository for Red Hat Enterprise Linux
+baseurl=http://apt.sw.be/redhat/el5/en/i386/dag
+gpgcheck=1
+gpgkey=http://dag.wieers.com/rpm/packages/RPM-GPG-KEY.dag.txt
+enabled=1
+
+EOL
+
+;;
+x86_64)
+
+cat <<EOL > /etc/yum.repos.d/dag.repo 
+
+[dag]
+name=Dag RPM Repository for Red Hat Enterprise Linux
+baseurl=http://apt.sw.be/redhat/el5/en/x86_64/dag
+gpgcheck=1
+gpgkey=http://dag.wieers.com/rpm/packages/RPM-GPG-KEY.dag.txt
+enabled=1
+
+EOL
+
+;;
+esac
+
+
+# Install Munin Server
+
+yum -y install munin
+
+# Install Munin managed node
+
+yum -y install munin-node 
+
+# Open up access globally
+
+echo "allow .*" >> /etc/munin/munin-node.conf
+
+# Configure some munin graphs
+
+service munin-node start 
+
+
+## Install Apache httpd 
+echo "## Install Apache httpd"
+date
+
+yum -y install httpd 
+service httpd start 
+
+
+## Install PostgreSQL 8.4
+echo "## Install PostgreSQL 8.4" 
+date
+
+cd ~/download
+
+case $EC2_ARCH in
+i386)
+
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-i386/compat-postgresql-libs-4-1PGDG.rhel5.i686.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-i386/$POSTGRES_RPM_NAME-libs-$POSTGRES_RPM_VERSION.rhel5.i386.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-i386/$POSTGRES_RPM_NAME-$POSTGRES_RPM_VERSION.rhel5.i386.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-i386/$POSTGRES_RPM_NAME-server-$POSTGRES_RPM_VERSION.rhel5.i386.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-i386/$POSTGRES_RPM_NAME-contrib-$POSTGRES_RPM_VERSION.rhel5.i386.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-i386/$POSTGRES_RPM_NAME-devel-$POSTGRES_RPM_VERSION.rhel5.i386.rpm 
+
+;;
+x86_64)
+
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-x86_64/compat-postgresql-libs-4-1PGDG.rhel5.x86_64.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-x86_64/$POSTGRES_RPM_NAME-libs-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-x86_64/$POSTGRES_RPM_NAME-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-x86_64/$POSTGRES_RPM_NAME-server-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-x86_64/$POSTGRES_RPM_NAME-contrib-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-x86_64/$POSTGRES_RPM_NAME-devel-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm
+# (not sure if i386 arch is needed?  Get anyway.)
+wget ftp://ftp5.us.postgresql.org/pub/PostgreSQL/binary/v$POSTGRES_VERSION/linux/rpms/redhat/rhel-5-x86_64/$POSTGRES_RPM_NAME-devel-$POSTGRES_RPM_VERSION.rhel5.i386.rpm 
+
+;;
+esac
+
+
+# postgresql-8.4.4-1PGDG needs libxslt
+
+yum -y install libxslt
+
+
+# postgresql-9.0.0-1PGDG contrib needs uuid
+wget http://download.fedora.redhat.com/pub/epel/5/i386/uuid-1.5.1-3.el5.i386.rpm
+rpm -Uvh uuid-1.5.1-3.el5.i386.rpm
+
+
+# Install postgresql rpms
+
+case $EC2_ARCH in
+i386)
+rpm -ivh --replacefiles compat-postgresql-libs-4-1PGDG.rhel5.i686.rpm
+;;
+x86_64)
+rpm -ivh --replacefiles compat-postgresql-libs-4-1PGDG.rhel5.x86_64.rpm
+;;
+esac
+
+rpm -e postgresql-libs
+
+case $EC2_ARCH in
+i386)
+rpm -ivh $POSTGRES_RPM_NAME-libs-$POSTGRES_RPM_VERSION.rhel5.i386.rpm
+rpm -ivh $POSTGRES_RPM_NAME-$POSTGRES_RPM_VERSION.rhel5.i386.rpm
+rpm -ivh $POSTGRES_RPM_NAME-server-$POSTGRES_RPM_VERSION.rhel5.i386.rpm
+rpm -ivh $POSTGRES_RPM_NAME-contrib-$POSTGRES_RPM_VERSION.rhel5.i386.rpm
+rpm -ivh $POSTGRES_RPM_NAME-devel-$POSTGRES_RPM_VERSION.rhel5.i386.rpm 
+;;
+x86_64)
+rpm -ivh $POSTGRES_RPM_NAME-libs-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm
+rpm -ivh $POSTGRES_RPM_NAME-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm
+rpm -ivh $POSTGRES_RPM_NAME-server-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm
+rpm -ivh $POSTGRES_RPM_NAME-contrib-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm
+rpm -ivh $POSTGRES_RPM_NAME-devel-$POSTGRES_RPM_VERSION.rhel5.x86_64.rpm 
+;;
+esac
+
+
+## Install Ruby components
+echo "## Install Ruby components" 
+date
+
+# Install Gems
+echo "# Install Gems" 
+date
+
+cd ~/download
+# Do not install the latest (as of September 2010) rubygems 1.3.7 as it gives
+# "ERROR:  Expected Ruby version >= 1.8.6, is 1.8.5"
+# Stick with 1.3.5 which worked in earlier testing.
+wget http://rubyforge.org/frs/download.php/60718/rubygems-1.3.5.tgz
+tar -zxvf rubygems-1.3.5.tgz
+cd rubygems-1.3.5
+#wget http://rubyforge.org/frs/download.php/69365/rubygems-1.3.6.tgz
+#tar -zxvf rubygems-1.3.6.tgz
+#cd rubygems-1.3.6
+#wget http://rubyforge.org/frs/download.php/70696/rubygems-1.3.7.tgz
+#tar -zxvf rubygems-1.3.7.tgz
+#cd rubygems-1.3.7
+ruby setup.rb
+
+
+# 2.3.8 now required by the OSM rails port c. September 2010
+# But rails port past c. March 2010 breaks ruby 1.8.5
+# Which breaks CentOS 5.4 - so let's live in the past.
+## Install Rails 2.3.5
+echo "# Install Rails 2.3.5" 
+date
+
+gem install --no-ri --no-rdoc --version 2.3.5 rails
+
+# Install Rails 2.3.8
+#echo "# Install Rails 2.3.8" 
+#date
+#
+#gem install --no-ri --no-rdoc --version 2.3.8 rails
+
+
+# Install PostgreSQL Adapter
+echo "# Install PostgreSQL Adapter" 
+date
+
+gem install --no-ri --no-rdoc pg -- --with-pg-config=$POSTGRES_CONFIG
+
+
+# Install OAuth
+echo "# Install OAuth" 
+date
+
+# Current version 0.4.2 c.September 2010 seems to give a problem 
+# at "rake db:migrate"
+#  -> "uninitialized constant Digest::Class"
+#gem install --no-ri --no-rdoc oauth
+gem install --no-ri --no-rdoc --version 0.3.6 oauth
+
+# Install httpclient
+echo "# Install httpclient" 
+date
+
+gem install --no-ri --no-rdoc httpclient 
+
+
+# Install rmagick
+echo "# Install rmagick" 
+date
+
+yum -y install ImageMagick 
+yum -y install ImageMagick-devel 
+gem install --no-ri --no-rdoc --version 1.15.17 rmagick -- --build-flags --enable-allow-example-errors
+
+
+# Upgrade libxml-ruby
+echo "# Upgrade libxml-ruby" 
+date
+
+yum -y install libxml2-devel 
+gem install --no-ri --no-rdoc libxml-ruby 
+
+
+# Install Phusion Passenger (mod_rails) 
+echo "# Install Phusion Passenger (mod_rails)" 
+date
+
+yum -y install httpd-devel-2.2.3 
+gem install --no-ri --no-rdoc passenger
+
+# Using "yes" allows passenger-install-apache2-module to run without human intervention.
+yes '' | passenger-install-apache2-module
+
+
+## Add hourly job to keep the file location database up to date.
+ln -s `which updatedb` /etc/cron.hourly/updatedb
+
+
+echo "####" 
+echo "#### Completed rc.dynamic.rebuild.local"
+echo "####     on $EC2_ARCH machine architecture"
+echo "####" 
+date
+
+
+# ENDS.
+

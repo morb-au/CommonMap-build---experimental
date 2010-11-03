@@ -1,0 +1,371 @@
+
+# Variables
+
+# Take common variables from included bash scripts
+DIR="$( cd "$( dirname "$0" )" && pwd )"
+source $DIR/rc.dynamic.environment.inc.sh
+source $DIR/../local/secrets.$CM_ENV.inc.sh
+source $DIR/../local/settings.$CM_ENV.inc.sh
+
+
+##PGSQL_SERVICE_DIR=/var/lib/pgsql
+#PGSQL_SERVICE_DIR=/var/lib/pgsql/9.0
+
+echo "####" 
+echo "#### Running rc.dynamic.local"
+echo "####" 
+date
+
+
+## Secure the secrets etc
+#chmod -R 700 $DIR/../*
+
+## Set local time
+#mv /etc/localtime /etc/localtime.orig
+#ln -s /usr/share/zoneinfo/$TIMEZONE_PATH /etc/localtime
+
+# Prepare to gather instance details
+mkdir /mnt/instance
+echo > /mnt/instance/meta-data.log
+
+# Get the User Data for this instance
+userdata=`curl http://169.254.169.254/latest/user-data`
+instanceid=`curl http://169.254.169.254/latest/meta-data/instance-id`
+securitygroups=`curl http://169.254.169.254/latest/meta-data/security-groups`
+
+echo 'User-data for this instance:' >> /mnt/instance/meta-data.log
+echo "$userdata" >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+# Start up some management services
+service munin-node start
+service httpd start
+
+service webmin start
+
+# Tell our dynamic DNS provider we're here!
+curl "https://rimuhosting.com/dns/dyndns.jsp?ttl=60&host=aws.$CM_ENV.commonmap.org&api_key=$RIMUHOSTING_API_KEY"
+
+# Tell our sysadmin we're here!
+echo >> /mnt/instance/meta-data.log
+echo 'Meta-data for this instance:' >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'public-hostname:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/public-hostname >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'security-groups:' >> /mnt/instance/meta-data.log
+echo "$securitygroups" >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'ami-id:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/ami-id >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'ami-launch-index:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/ami-launch-index >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'ami-manifest-path:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/ami-manifest-path >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'instance-id:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/instance-id >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'instance-action:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/instance-action >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'instance-type:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/instance-type >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'local-hostname:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/local-hostname >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'reservation-id:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/reservation-id >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'availability-zone:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/placement/availability-zone >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+echo 'ancestor-ami-ids:' >> /mnt/instance/meta-data.log
+curl http://169.254.169.254/latest/meta-data/ancestor-ami-ids >> /mnt/instance/meta-data.log
+echo >> /mnt/instance/meta-data.log
+
+echo >> /mnt/instance/meta-data.log
+
+mail -s "[commonmap-bots] A $CM_ENV.commonmap.org is starting up" root@commonmap.info < /mnt/instance/meta-data.log
+
+for token in $userdata
+do
+  curl "https://rimuhosting.com/dns/dyndns.jsp?ttl=60&host=$token.$CM_ENV.commonmap.org&api_key=$RIMUHOSTING_API_KEY"
+
+
+  case $token in
+    db-core)
+#      ec2-attach-volume vol-9f3ae6f6 -i $instanceid --device $EBS_DEVICE_PATH_DB_CORE -K $EC2_PRIVATE_KEY -C $EC2_CERT
+
+      # Change the hostname from the AWS domU default
+      hostname db-core.$CM_ENV.commonmap.org
+      sed -i "s/localhost\.localdomain/db-core.$CM_ENV.commonmap.org/g" /etc/hosts
+
+      # wait for volume to come up
+      # (WARNING: this will hang if there is more than one instance trying to attach to this device.)
+      while [ ! -e $EBS_DEVICE_PATH_DB_CORE ]; do
+        sleep 1;
+      done 
+
+#      mkdir -p /mnt/db-core
+      mount $EBS_DEVICE_PATH_DB_CORE /mnt/$EBS_MOUNT_LOCATION_DB_CORE
+#      mv $PGSQL_SERVICE_DIR/data-cm-core $PGSQL_SERVICE_DIR/data-cm-core.orig
+#      ln -s /mnt/db-core/pgsql/data $PGSQL_SERVICE_DIR/data-cm-core
+      
+      service postgresql-cm-core start
+      
+      # register private IP address for the benefit of the database clients
+      localip=`curl http://169.254.169.254/latest/meta-data/local-ipv4`
+      echo "https://rimuhosting.com/dns/dyndns.jsp?ttl=60&host=$token.private.$CM_ENV.commonmap.org&value=$localip&api_key=$RIMUHOSTING_API_KEY"
+      curl "https://rimuhosting.com/dns/dyndns.jsp?ttl=60&host=$token.private.$CM_ENV.commonmap.org&value=$localip&api_key=$RIMUHOSTING_API_KEY"
+
+#      # A hack to allow the osmosis replicator to deal with
+#      # pgsql extensions.
+#      # TODO: Move this to the machine build script instead.
+#      cd /var/www/commonmap/rails/db/functions
+#      make libpgosm.so
+
+    ;;
+    
+    
+    
+    api)
+#      ec2-attach-volume vol-933ae6fa -i $instanceid --device $EBS_DEVICE_PATH_API -K $EC2_PRIVATE_KEY -C $EC2_CERT
+
+      # Change the hostname from the AWS domU default
+      hostname api.$CM_ENV.commonmap.org
+      sed -i "s/localhost\.localdomain/api.$CM_ENV.commonmap.org/g" /etc/hosts
+
+      # wait for volume to come up
+      # (WARNING: this will hang if there is more than one instance trying to attach to this device.)
+      while [ ! -e $EBS_DEVICE_PATH_API ]; do
+        sleep 1;
+      done 
+
+#      mkdir -p /mnt/api
+      mount $EBS_DEVICE_PATH_API /mnt/$EBS_MOUNT_LOCATION_API
+#      mv /var/www/commonmap/rails /var/www/commonmap/rails.orig
+#      ln -s /mnt/api/osm/rails_port /var/www/commonmap/rails
+
+# this is now embedded in rebuild.api.local
+#      # Add Apache httpd ServerName directive to configuration
+#      sed -i "s/DocumentRoot/ServerName api.$CM_ENV.commonmap.org\n    DocumentRoot/g" /etc/httpd/conf.d/osm.conf
+
+       # Restart httpd, as not just munin, but also rails_port, is running now
+      service httpd restart
+      
+      ## Start up gpx importer
+      ## TODO: Move this into init.d auto startup
+      echo "## Start up gpx importer" 
+      date
+      cd ~/download/svn/gpx-import/
+      ./settings.sh start src/gpx-import
+    ;;
+    
+    
+    
+    planet)
+#      ec2-attach-volume vol-7d3be714 -i $instanceid --device $EBS_DEVICE_PATH_PLANET -K $EC2_PRIVATE_KEY -C $EC2_CERT
+      
+      # Change the hostname from the AWS domU default
+      hostname planet.$CM_ENV.commonmap.org
+      sed -i "s/localhost\.localdomain/planet.$CM_ENV.commonmap.org/g" /etc/hosts
+
+      # wait for volume to come up
+      # (WARNING: this will hang if there is more than one instance trying to attach to this device.)
+      while [ ! -e $EBS_DEVICE_PATH_PLANET ]; do
+        sleep 1;
+      done 
+
+#      mkdir -p /mnt/planet
+      mount $EBS_DEVICE_PATH_PLANET /mnt/$EBS_MOUNT_LOCATION_PLANET
+#      mkdir -p /mnt/planet/public
+#      mv /var/www/commonmap/planet/public /var/www/commonmap/planet/public.orig
+#      ln -s /mnt/planet/public /var/www/commonmap/planet/public
+      
+# this is now embedded in rebuild.planet.local
+#      # Remove the default welcome page - go straight to planet files listing
+#      mv /etc/httpd/conf.d/welcome.conf /etc/httpd/conf.d/welcome.conf.disable 
+#
+#      # Adjust any reference to 'demo' in the canned httpd config file
+#      sed -i "s/planet.demo.commonmap.org/planet.$CM_ENV.commonmap.org/g" /etc/httpd/conf.d/planet.conf
+#
+#      # Add the ability to follow the commonmap.planet.earth.latest.osm symlink
+#      sed -i "s/Options Indexes$/Options Indexes FollowSymLinks/g" /etc/httpd/conf.d/planet.conf
+
+# this is now embedded in rebuild.api.local
+#      # Relegate the default osm.conf to a named website
+#      sed -i "s/DocumentRoot/ServerName api.$CM_ENV.commonmap.org\n    DocumentRoot/g" /etc/httpd/conf.d/osm.conf
+
+# this is now embedded in rebuild.planet.local
+#      # Restart httpd, as not just munin, but also the planet directory, is running now
+#      service httpd restart
+
+# this is now embedded in rebuild.planet.local
+#      # Add an hourly task to run the osmosis replicator
+#      ln -s /mnt/scripts/$CM_ENV/rc.dynamic.db-core2replicate.local /etc/cron.hourly/order.10.apidb-replicate
+#
+#      # Add a daily task to rebuild the planet
+#      ln -s /mnt/scripts/$CM_ENV/rc.dynamic.db-core2planet.local /etc/cron.daily/order.10.planet.rebuild
+#      
+#      # Add an daily task to compress the planet
+#      ln -s /mnt/scripts/$CM_ENV/rc.dynamic.planet2planetz.local /etc/cron.daily/order.40.planetz.rebuild
+
+#      # Add an hourly task to derive the latest changes from the planet
+#      ln -s /mnt/scripts/$CM_ENV/rc.dynamic.planet-and-db-core2planetchange.local /etc/cron.hourly/order.30.planet.derive-change
+      
+# this is now embedded in rebuild.planet.local
+#      # Run the first osmosis replication
+#      /mnt/scripts/$CM_ENV/rc.dynamic.db-core2replicate.local
+    ;;
+
+
+
+    db-tile)
+#      ec2-attach-volume vol-733be71a -i $instanceid --device $EBS_DEVICE_PATH_DB_TILE -K $EC2_PRIVATE_KEY -C $EC2_CERT
+
+      # Change the hostname from the AWS domU default
+      hostname db-tile.$CM_ENV.commonmap.org
+      sed -i "s/localhost\.localdomain/db-tile.$CM_ENV.commonmap.org/g" /etc/hosts
+
+      # wait for volume to come up
+      # (WARNING: this will hang if there is more than one instance trying to attach to this device.)
+      while [ ! -e $EBS_DEVICE_PATH_DB_TILE ]; do
+        sleep 1;
+      done 
+
+#      mkdir -p /mnt/db-tile
+      mount $EBS_DEVICE_PATH_DB_TILE /mnt/$EBS_MOUNT_LOCATION_DB_TILE
+#      mkdir -p /mnt/db-tile/pgsql/data
+#      mv $PGSQL_SERVICE_DIR/data-cm-tile $PGSQL_SERVICE_DIR/data-cm-tile.orig
+#      ln -s /mnt/db-tile/pgsql/data $PGSQL_SERVICE_DIR/data-cm-tile
+      
+      service postgresql-cm-tile start
+      
+      # register private IP address for the benefit of the database clients
+      localip=`curl http://169.254.169.254/latest/meta-data/local-ipv4`
+      echo "https://rimuhosting.com/dns/dyndns.jsp?ttl=60&host=$token.private.$CM_ENV.commonmap.org&value=$localip&api_key=$RIMUHOSTING_API_KEY"
+      curl "https://rimuhosting.com/dns/dyndns.jsp?ttl=60&host=$token.private.$CM_ENV.commonmap.org&value=$localip&api_key=$RIMUHOSTING_API_KEY"
+
+#      # initialise the osmosis temporary directories for frequent updates
+#      mkdir -p /mnt/osmosis-replication
+#      /root/download/svn/osmosis/bin/osmosis --read-replication-interval-init workingDirectory=/mnt/osmosis-replication
+#
+#      sed -i "s/openstreetmap\.org/$CM_ENV.commonmap.org/g" /mnt/osmosis-replication/configuration.txt
+#      sed -i "s/minute/hour/g" /mnt/osmosis-replication/configuration.txt
+#      sed -i "s/3600/12600/g" /mnt/osmosis-replication/configuration.txt
+
+#      # Seed the tile rendering database with the latest full planet file
+#      mkdir -p /mnt/planet-for-db-tile
+#      cd /mnt/planet-for-db-tile
+#      rm -f commonmap.planet.earth.latest.osm
+#      wget http://planet.$CM_ENV.commonmap.org/commonmap.planet.earth.latest.osm
+#      su - postgres -c "osm2pgsql -P 5434 -d mod_tile_pr --slim /mnt/planet-for-db-tile/commonmap.planet.earth.latest.osm" 
+
+#      # A hack to allow 'apache' to access some more of the tables
+#      # TODO: Move this to the machine build script instead.
+#      su - postgres -c "psql --port 5434 -d mod_tile_pr -c 'GRANT SELECT ON geometry_columns TO PUBLIC'"
+    
+#      # Add an hourly task to rebuild the tile rendering database
+#      ln -s /mnt/scripts/$CM_ENV/rc.dynamic.planet2db-tile.local /etc/cron.hourly/order.20.db-tile.rebuild
+    ;;
+    
+    
+    
+    tile)
+#      ec2-attach-volume vol-4b3be722 -i $instanceid --device $EBS_DEVICE_PATH_TILE -K $EC2_PRIVATE_KEY -C $EC2_CERT
+      
+      # Change the hostname from the AWS domU default
+      hostname tile.$CM_ENV.commonmap.org
+      sed -i "s/localhost\.localdomain/tile.$CM_ENV.commonmap.org/g" /etc/hosts
+
+      # wait for volume to come up
+      # (WARNING: this will hang if there is more than one instance trying to attach to this device.)
+      while [ ! -e $EBS_DEVICE_PATH_TILE ]; do
+        sleep 1;
+      done 
+
+#      mkdir -p /mnt/tile
+      mount $EBS_DEVICE_PATH_TILE /mnt/$EBS_MOUNT_LOCATION_TILE
+#      mkdir -p /mnt/tile/tiles/public
+      chown -R apache /mnt/tile/tiles/public
+#      mv /var/www/commonmap/tile/public /var/www/commonmap/tile/public.orig
+#      ln -s /mnt/tile/tiles/public /var/www/commonmap/tile/public
+
+      # register private IP address for the benefit of the the db-tile replication sink (planet-import-complete)
+      localip=`curl http://169.254.169.254/latest/meta-data/local-ipv4`
+      echo "https://rimuhosting.com/dns/dyndns.jsp?ttl=60&host=$token.private.$CM_ENV.commonmap.org&value=$localip&api_key=$RIMUHOSTING_API_KEY"
+      curl "https://rimuhosting.com/dns/dyndns.jsp?ttl=60&host=$token.private.$CM_ENV.commonmap.org&value=$localip&api_key=$RIMUHOSTING_API_KEY"
+
+
+# this is now embedded in rebuild.tile.local
+#      # update the httpd config file with some late-breaking settings
+#      #  (including MGMaps-related rewrites)
+#      #sed -i "s/\/var\/www\/html/\/var\/www\/commonmap\/tile\/public/g" /etc/httpd/conf.d/mod_tile.conf
+#      mv /etc/httpd/conf.d/mod_tile.conf /etc/httpd/conf.d/mod_tile.conf.old
+#      cp /mnt/scripts/$CM_ENV/mod_tile.conf /etc/httpd/conf.d/
+
+
+# this is now embedded in rebuild.tile.local
+#      # Update the mapnik style with a version with the CommonMapnik tweaks
+#      /mnt/scripts/$CM_ENV/rc.dynamic.tile.update-style.local
+      
+
+      # Restart httpd, as not just munin, but also mod_tile, is running now
+      service httpd restart
+      
+      
+# this is now embedded in rebuild.tile.local
+#      # Bring up renderd as a daemon - add it to inittab respawn as it tends to crash often
+#      mkdir -p /var/run/renderd
+#      echo >> /etc/inittab
+#      echo '# Commonmap, renderd' >> /etc/inittab
+#      echo 'c0:2345:respawn:/root/download/svn/mod_tile/renderd -f' >> /etc/inittab
+#      telinit q
+#      #/root/download/svn/mod_tile/renderd
+
+    ;;
+  esac
+  
+  mail -s "[commonmap-bots] $token.$CM_ENV.commonmap.org is on the network" root@commonmap.info < /mnt/instance/meta-data.log
+
+done
+
+## Update the filename database (for the 'locate' command)
+echo "## Update the filename database" 
+date
+
+updatedb
+
+
+echo "####" 
+echo "#### Completed rc.dynamic.local"
+echo "####" 
+date
+

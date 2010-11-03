@@ -1,0 +1,105 @@
+#!/bin/bash
+#
+# A Script to convert from the Core database to Planet XML format to the Tile Rendering database
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+# Variables
+
+#### Perform planet compressed copies
+echo "####" 
+echo "#### Perform compressed copies" 
+echo "####" 
+date  
+
+
+## Serialise execution of this script
+
+LOCKFILE=/tmp/rc.dynamic.planet2planetz.local.lock
+ 
+if [ -f $LOCKFILE ]; then
+  if [ "$(ps -p `cat $LOCKFILE` | wc -l)" -gt 1 ]; then
+    # process is still running
+    echo "Locked"
+    exit 1
+  else
+    # process not running, but lock file not deleted?
+    echo "WARNING: Previous execution did not run to completion"
+    rm $LOCKFILE
+  fi
+fi
+echo $$ > $LOCKFILE
+
+
+## Build planet
+
+# Collect the actual name of the raw file
+#  so that we have no inconsistency if
+#  the raw file "latest" file is updated
+#  between the gzip and bzip2 runs later here.
+cd /var/www/commonmap/planet/public/
+TARGET_RAW=$(readlink commonmap.planet.earth.latest.osm)
+
+
+
+# raw to gzip
+
+# Possibly need the trailing / to distinguish the softlink from the original
+cd /var/www/commonmap/planet/public/
+
+echo "## Creating the gzip planet file, from $TARGET_RAW." 
+date  
+
+nice gzip --stdout $TARGET_RAW > commonmap.planet.earth.latest.osm.gz
+
+echo "# Created the gzip planet file, from $TARGET_RAW." 
+date  
+
+
+# raw to bzip2
+
+# Possibly need the trailing / to distinguish the softlink from the original
+cd /var/www/commonmap/planet/public/
+
+echo "## Creating the bzip2 planet file, from $TARGET_RAW." 
+date  
+
+nice bzip2 --stdout $TARGET_RAW > commonmap.planet.earth.latest.osm.bz2
+
+echo "# Created the bzip2 planet file, from $TARGET_RAW." 
+date  
+
+
+
+## End of serialised section
+rm $LOCKFILE
+
+#### Performed planet compressed copies
+echo "####" 
+echo "#### Performed compressed copies" 
+echo "####" 
+date  
+
+# ENDS.

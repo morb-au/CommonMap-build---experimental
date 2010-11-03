@@ -1,0 +1,110 @@
+#!/bin/bash
+#
+# A Script to build the base RightScale CentOS 5.4 Amazon Machine Image 
+#   ami-f8b35e91
+# Modified by the base rebuild script
+#    rc.dynamic.rebuild.local
+# Modified Into a tile server for CommonMap purposes
+#   http://commonmap.info/w/index.php/Server/Setup/Demonstration/AWS
+# And update the map style file from th dynamic scripts directory
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+# Variables
+
+# Take common variables from included bash scripts
+DIR="$( cd "$( dirname "$0" )" && pwd )"
+source $DIR/rc.dynamic.environment.inc.sh
+source $DIR/../local/secrets.$CM_ENV.inc.sh
+
+PGSQL_SERVICE_HOST=db-tile.private.$CM_ENV.commonmap.org  # TODO: Does osm2pgsql handle remote databases anyway?
+PGSQL_SERVICE_PORT=5434
+
+
+#### Update Mapnik tile style
+echo "####" 
+echo "#### Update Mapnik tile style" 
+echo "####" 
+date 
+
+
+# Copy main style file from (as at boot time) the S3 bucket
+
+mv /var/www/commonmap/render/osm-mapnik/osm.xml /var/www/commonmap/render/osm-mapnik/osm.xml.old
+cp /mnt/scripts/$CM_ENV/osm.xml /var/www/commonmap/render/osm-mapnik/
+
+# Copy layers file from (as at boot time) the S3 bucket
+
+mv /var/www/commonmap/render/osm-mapnik/inc/layers.xml.inc /var/www/commonmap/render/osm-mapnik/inc/layers.xml.inc.old
+cp /mnt/scripts/$CM_ENV/inc/layers.xml.inc /var/www/commonmap/render/osm-mapnik/inc/
+
+# Copy layer-land style file from (as at boot time) the S3 bucket
+
+mv /var/www/commonmap/render/osm-mapnik/inc/layer-land.xml.inc /var/www/commonmap/render/osm-mapnik/inc/layer-land.xml.inc.old
+cp /mnt/scripts/$CM_ENV/inc/layer-land.xml.inc /var/www/commonmap/render/osm-mapnik/inc/
+
+# Copy layer-water style file from (as at boot time) the S3 bucket
+
+mv /var/www/commonmap/render/osm-mapnik/inc/layer-water.xml.inc /var/www/commonmap/render/osm-mapnik/inc/layer-water.xml.inc.old
+cp /mnt/scripts/$CM_ENV/inc/layer-water.xml.inc /var/www/commonmap/render/osm-mapnik/inc/
+
+# Copy layer-admin style file from (as at boot time) the S3 bucket
+
+mv /var/www/commonmap/render/osm-mapnik/inc/layer-admin.xml.inc /var/www/commonmap/render/osm-mapnik/inc/layer-admin.xml.inc.old
+cp /mnt/scripts/$CM_ENV/inc/layer-admin.xml.inc /var/www/commonmap/render/osm-mapnik/inc/
+
+
+# A hack to make 'generate_xml.py' work below.
+cd /var/www/commonmap/render/osm-mapnik/
+mkdir -p world_boundaries
+
+# Bind mapnik to our rendering database
+echo "## Bind mapnik to our rendering database" 
+date
+
+cd /var/www/commonmap/render/osm-mapnik/
+#echo "Running: python /var/www/commonmap/render/osm-mapnik/generate_xml.py osm.xml osm-local.xml --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT --user mod_tile_pr --password $PGSQL_SERVICE_PASSWORD --dbname mod_tile_pr"
+#python /var/www/commonmap/render/osm-mapnik/generate_xml.py osm.xml osm-local.xml --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT --user mod_tile_pr --password $PGSQL_SERVICE_PASSWORD --dbname mod_tile_pr 
+## The running of generate_xml.py under 'nohup' fools the 'sys.stdin.isatty()'
+## test in generate_xml.py, therefore we will pipe in the xml template
+## through stdin
+## rather than specifying it on the command line.
+## TODO: Report this upstream as a bug.
+echo "Running: python /var/www/commonmap/render/osm-mapnik/generate_xml.py osm-local.xml --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT --user mod_tile_pr --password $PGSQL_SERVICE_PASSWORD --dbname mod_tile_pr < osm.xml"
+python /var/www/commonmap/render/osm-mapnik/generate_xml.py osm-local.xml --host $PGSQL_SERVICE_HOST --port $PGSQL_SERVICE_PORT --user mod_tile_pr --password $PGSQL_SERVICE_PASSWORD --dbname mod_tile_pr < osm.xml 
+ 
+
+
+# TODO: Restart renderd to pick up new style file
+killall -v renderd
+
+#### Updated Mapnik tile style
+echo "####" 
+echo "#### Updated Mapnik tile style" 
+echo "####" 
+date 
+
+
+# ENDS.

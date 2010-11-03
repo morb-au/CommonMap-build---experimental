@@ -1,0 +1,120 @@
+#!/bin/bash
+#
+# A Script to convert from the Core database to Planet XML format to the Tile Rendering database
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+# Variables
+
+# Take common variables from included bash scripts
+DIR=/mnt/scripts/local
+source $DIR/rc.dynamic.environment.inc.sh
+source $DIR/../local/secrets.$CM_ENV.inc.sh
+
+PGSQL_SERVICE_HOST=db-core.private.$CM_ENV.commonmap.org
+
+#### Perform planet creation
+echo "####" 
+echo "#### Perform planet creation" 
+echo "####" 
+date  
+
+
+## Serialise execution of this script
+
+LOCKFILE=/tmp/rc.dynamic.db-core2planet.local.lock
+ 
+if [ -f $LOCKFILE ]; then
+  if [ "$(ps -p `cat $LOCKFILE` | wc -l)" -gt 1 ]; then
+    # process is still running
+    echo "Locked"
+    exit 1
+  else
+    # process not running, but lock file not deleted?
+    echo "WARNING: Previous execution did not run to completion"
+    rm $LOCKFILE
+  fi
+fi
+echo $$ > $LOCKFILE
+
+
+## Build planet
+
+TIMESTAMP=`date -u +%Y-%m-%d-%H-%M-%S`
+
+
+# raw
+
+# Possibly need the trailing / to distinguish the softlink from the original
+cd /var/www/commonmap/planet/public/
+
+
+# raw full
+
+# Give Java more heap
+export JAVACMD_OPTIONS=-Xmx512m
+
+# raise from the default 1024, keep osmosis happy
+ulimit -u 2048
+
+echo "## Creating the raw planet file, timestamp $TIMESTAMP." 
+date  
+
+nice /root/download/svn/osmosis/bin/osmosis --read-apidb dbType="postgresql" validateSchemaVersion="no" host="$PGSQL_SERVICE_HOST" database="commonmap_pr" user="commonmap_pr" password="$PGSQL_SERVICE_PASSWORD" --write-xml file="commonmap.planet.earth.$TIMESTAMP.osm"
+
+echo "# Created the raw planet file, timestamp $TIMESTAMP." 
+date  
+
+
+# raw - bump the softlink to the latest version
+
+cd /var/www/commonmap/planet/public/
+TARGET_OLD=$(readlink commonmap.planet.earth.latest.osm)
+ln -s -f commonmap.planet.earth.$TIMESTAMP.osm commonmap.planet.earth.latest.osm
+
+# raw - archive old file to bzip2
+echo "## Archiving the old raw planet file, $TARGET_OLD." 
+date  
+
+nice bzip2 $TARGET_OLD
+
+echo "# Archived the old raw planet file." 
+date  
+
+
+## Note: Compressed copies of the current raw planet file
+##   are handled in a different script.
+
+
+## End of serialised section
+rm $LOCKFILE
+
+#### Performed planet creation
+echo "####" 
+echo "#### Performed planet creation" 
+echo "####" 
+date  
+
+# ENDS.

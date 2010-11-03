@@ -1,0 +1,506 @@
+#!/bin/bash
+#
+# A Script to build the base RightScale CentOS 5.4 Amazon Machine Image 
+#       ami-f8b35e91 (32 bit)
+#     or
+#       ami-ccb35ea5 (64 bit)
+#   Modified by the base rebuild script
+#       rc.dynamic.rebuild.local
+#     or
+#       rc.dynamic.rebuild.x64.local
+# Into a "db-tile" server for CommonMap purposes
+#   http://commonmap.info/w/index.php/Server/Setup/Demonstration/AWS
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+# Variables
+
+# Take common variables from included bash scripts
+DIR="$( cd "$( dirname "$0" )" && pwd )"
+source $DIR/rc.dynamic.environment.inc.sh
+source $DIR/../local/secrets.$CM_ENV.inc.sh
+source $DIR/../local/settings.$CM_ENV.inc.sh
+
+PGSQL_SERVICE_SUFFIX=cm-tile
+PGSQL_SERVICE_PORT=5434  # a non standard port so that it can co-exist with db-core
+#PGSQL_SERVICE_DATA_DIR=/var/lib/pgsql/data
+PGSQL_SERVICE_DATA_DIR=/var/lib/pgsql/9.0/data
+#PGSQL_SERVICE_CONTRIB_DIR=/usr/share/pgsql/contrib
+PGSQL_SERVICE_CONTRIB_DIR=/usr/pgsql-9.0/share/contrib 
+#PGSQL_SERVICE_INIT_FILE=/etc/init.d/postgresql
+PGSQL_SERVICE_INIT_FILE=/etc/init.d/postgresql-9.0
+
+PGSQL_SERVICE_PUBLIC_HOST=db-tile.$CM_ENV.commonmap.org
+
+#POSTGRES_CONFIG=/usr/local/bin/pg_config (probably)
+POSTGRES_CONFIG=/usr/pgsql-9.0/bin/pg_config 
+
+#PGSQL_SERVICE_CONTRIB_POSTGIS_DIR=/usr/share/pgsql/contrib
+PGSQL_SERVICE_CONTRIB_POSTGIS_DIR=/usr/pgsql-9.0/share/contrib/postgis-1.5 
+
+if [ $( arch ) = 'x86_64' ]; then
+  EC2_ARCH=x86_64
+else
+  EC2_ARCH=i386
+fi
+ 
+
+## Allow Webmin to access this database
+### TODO: Webmin is probably not useful if not running on native port 5432.
+
+
+#### Establish db-tile service
+echo "####" 
+echo "#### Establish db-tile service" 
+echo "####" 
+date 
+
+
+# New service, inherited from standard postgresql behaviours
+
+cp $PGSQL_SERVICE_INIT_FILE /etc/init.d/postgresql-$PGSQL_SERVICE_SUFFIX
+
+cat <<EOL > /etc/sysconfig/pgsql/postgresql-$PGSQL_SERVICE_SUFFIX
+
+PGDATA=$PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+PGPORT=$PGSQL_SERVICE_PORT
+
+EOL
+
+
+# Create and attach EBS volume.  Method inspired by:
+# http://alestic.com/2010/02/ec2-resize-running-ebs-root
+EBS_VOLUME_ID=$(ec2-create-volume --availability-zone $EC2_AVAILABILITY_ZONE --size $EBS_SIZE_GB_DB_TILE -K $EC2_PRIVATE_KEY -C $EC2_CERT | cut -f2)
+echo "New EBS volume created.  ID: $EBS_VOLUME_ID"
+
+# Volume creation takes a little time so we have to try repeatedly
+SELF_EC2_INSTANCE_ID=`curl http://169.254.169.254/latest/meta-data/instance-id` 
+ec2-attach-volume --instance $SELF_EC2_INSTANCE_ID --device $EBS_DEVICE_PATH_DB_TILE $EBS_VOLUME_ID -K $EC2_PRIVATE_KEY -C $EC2_CERT
+while ! ec2-describe-volumes $EBS_VOLUME_ID -K $EC2_PRIVATE_KEY -C $EC2_CERT | grep -q attached; do sleep 1; done
+echo "New EBS volume $EBS_VOLUME_ID attached to this EC2 instance $SELF_EC2_INSTANCE_ID as $EBS_DEVICE_PATH_DB_TILE"
+
+# Initialise the filesystem
+mkfs.ext3 -F -L $EBS_EXT3_LABEL_DB_TILE $EBS_DEVICE_PATH_DB_TILE
+
+# Mount it
+mkdir -p /mnt/$EBS_MOUNT_LOCATION_DB_TILE 
+mount $EBS_DEVICE_PATH_DB_TILE /mnt/$EBS_MOUNT_LOCATION_DB_TILE 
+
+
+# New data directory for db-tile
+mkdir -p /mnt/$EBS_MOUNT_LOCATION_DB_TILE/pgsql/data
+ln -s /mnt/$EBS_MOUNT_LOCATION_DB_TILE/pgsql/data $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+
+
+# Make postgres have full control of its directories
+chown -R postgres:postgres $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+chmod -R 700 $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+chown -R postgres:postgres /mnt/$EBS_MOUNT_LOCATION_DB_TILE/pgsql
+chmod -R 700 /mnt/$EBS_MOUNT_LOCATION_DB_TILE/pgsql 
+
+
+echo "## Initialise and start database" 
+date 
+
+# Initialise database
+service postgresql-$PGSQL_SERVICE_SUFFIX initdb
+
+# Give postgres a self signed certificate so that clients can choose
+# to assert an encrypted connection
+# TODO: This is experimental, 2010-10-31
+cd $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX
+openssl req -new -text -nodes -x509 -batch -days 3650 -subj "/C=AU/ST=Queensland/OU=CommonMap Inc/CN=$PGSQL_SERVICE_PUBLIC_HOST" -keyout server.key -out server.crt
+
+# Special treatment for the SSL material
+chown postgres:postgres $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/server.*
+chmod 600 $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/server.*
+
+
+# Start database service
+service postgresql-$PGSQL_SERVICE_SUFFIX start
+
+
+## Install postgis
+echo "## Install postgis" 
+date 
+
+# Get dependencies
+
+yum -y install proj-devel
+#yum -y install geos
+#
+## Or maybe GEOS >= 3.1.1 for PostGIS 1.5.2 for PostgreSQL 9.0
+echo "## Install GEOS >= 3.1.1 for PostGIS 1.5.2 for PostgreSQL 9.0" 
+date 
+
+mkdir -p ~/download
+cd ~/download
+wget http://download.osgeo.org/geos/geos-3.2.2.tar.bz2
+tar -jxvf geos-3.2.2.tar.bz2
+cd geos-3.2.2
+./configure
+
+make
+make install
+
+# bring libgeos to the attention of ldconfig
+echo "# bring libgeos to the attention of ldconfig" 
+date 
+
+case $EC2_ARCH in
+i386)
+echo "/usr/local/lib" >> /etc/ld.so.conf.d/geos-3.2.2-local-libs.conf 
+;;
+x86_64)
+echo "/usr/local/lib64" >> /etc/ld.so.conf.d/geos-3.2.2-local-libs.conf
+;;
+esac 
+ldconfig -v
+
+# don't forget to comment out "yum -y install geos-devel" in rebuild.tile
+
+# Get and build postgis 1.4 itself
+# Or postgis 1.5 which is meant to be compatible with PostgreSQL 9.0
+# Or postgis 1.5.2 which is really meant to be compatible with PostgreSQL 9.0
+echo "## Install postgis 1.5.2 which is really meant to be compatible with PostgreSQL 9.0" 
+date 
+
+
+mkdir -p ~/download
+cd ~/download
+#wget http://postgis.refractions.net/download/postgis-1.4.1.tar.gz
+#tar -zxvf postgis-1.4.1.tar.gz
+#cd postgis-1.4.1
+#wget http://postgis.refractions.net/download/postgis-1.5.1.tar.gz
+#tar -zxvf postgis-1.5.1.tar.gz
+#cd postgis-1.5.1
+#wget http://trac.osgeo.org/postgis/raw-attachment/wiki/WikiStart/postgis-1.5.2rc1.tar.gz
+#tar -zxvf postgis-1.5.2rc1.tar.gz
+#cd postgis-1.5.2rc1
+wget http://postgis.refractions.net/download/postgis-1.5.2.tar.gz
+tar -zxvf postgis-1.5.2.tar.gz
+cd postgis-1.5.2
+
+./configure --with-pgconfig=$POSTGRES_CONFIG
+make
+make install 
+
+case $EC2_ARCH in
+i386)
+echo "/usr/local/lib" >> /etc/ld.so.conf.d/postgis-1.5.2-local-libs.conf 
+;;
+x86_64)
+echo "/usr/local/lib64" >> /etc/ld.so.conf.d/postgis-1.5.2-local-libs.conf
+;;
+esac 
+ldconfig -v
+
+
+## Populate with database instances
+echo "## Populate with database instances" 
+date 
+
+# Create user roles (requires manual intervention to enter passwords)
+
+#yes $PGSQL_SERVICE_PASSWORD | su - postgres -c "createuser --port $PGSQL_SERVICE_PORT -S -D -R apache"
+yes $PGSQL_SERVICE_PASSWORD | su - postgres -c "createuser --port $PGSQL_SERVICE_PORT mod_tile_pr -s -P"
+
+# Create databases
+
+su - postgres -c "createdb --port $PGSQL_SERVICE_PORT -T template0 -E UTF8 -O mod_tile_pr mod_tile_pr"
+
+# Create database language
+
+su - postgres -c "createlang --port $PGSQL_SERVICE_PORT plpgsql mod_tile_pr"
+
+# Create geospatial awareness
+echo "# Create geospatial awareness" 
+date 
+
+su - postgres -c "psql --port $PGSQL_SERVICE_PORT -d mod_tile_pr < $PGSQL_SERVICE_CONTRIB_POSTGIS_DIR/postgis.sql"
+su - postgres -c "psql --port $PGSQL_SERVICE_PORT -d mod_tile_pr < $PGSQL_SERVICE_CONTRIB_POSTGIS_DIR/spatial_ref_sys.sql"
+
+# Create intarray awareness (for planet replication and diffs)
+echo "# Create intarray awareness (for planet replication and diffs)" 
+date 
+
+su - postgres -c "psql --port $PGSQL_SERVICE_PORT -d mod_tile_pr < $PGSQL_SERVICE_CONTRIB_DIR/_int.sql"
+
+
+# A hack to allow the osm2pgsql user to access some more of the tables
+su - postgres -c "psql --port $PGSQL_SERVICE_PORT -d mod_tile_pr -c 'GRANT SELECT ON geometry_columns TO PUBLIC'"
+     
+
+
+## Set up connection permissions
+echo "## Set up connection permissions" 
+date 
+
+
+# In postgresql.conf (append to existing configuration)
+
+cat <<EOL >> $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/postgresql.conf
+
+# CommonMap customisation - allows an application tier to connect remotely
+listen_addresses = '*'
+ssl = on 
+
+EOL
+
+# In pg_hba.conf (substitute ident for trust authentication)
+
+sed -i 's/ident/trust/g' $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/pg_hba.conf
+      
+# In pg_hba.conf (append to existing configuration)
+
+cat <<EOL >> $PGSQL_SERVICE_DATA_DIR-$PGSQL_SERVICE_SUFFIX/pg_hba.conf
+
+# CommonMap customisation - allows an application tier to connect remotely
+#  over the semi-trusted AWS internal network.
+host    all             all             192.168.0.0/16          md5
+host    all             all             172.16/12               md5
+host    all             all             10.0.0.0/8              md5
+
+# CommonMap customisation - allows a database administrator to connect remotely
+#  over the untrusted internet; SSL is required.
+hostssl all             all             0.0.0.0/0               md5
+
+EOL
+ 
+
+# Restart database service to pick up new settings
+service postgresql-$PGSQL_SERVICE_SUFFIX restart
+
+
+
+## Install Osmosis
+echo "## Install Osmosis" 
+date 
+
+# Install dependencies
+
+yum -y install ant
+yum -y install ant-nodeps
+yum -y install junit
+yum -y install ant-junit 
+
+# Install osmosis itself
+echo "# Install osmosis itself" 
+date 
+
+mkdir -p ~/download/svn 
+cd ~/download/svn
+# SVN HEAD in c.September 2010 failed unit testing
+#svn checkout http://svn.openstreetmap.org/applications/utils/osmosis/trunk osmosis 
+svn checkout http://svn.openstreetmap.org/applications/utils/osmosis/branches/0.35-fixes osmosis 
+cd ~/download/svn/osmosis
+
+echo "# Apply last minute fixes that replace int4 with int8 latitudes and longitudes" 
+date
+sed -i 's/PRECISION = 7/PRECISION = 16/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/int MULTIPLICATION_FACTOR/long MULTIPLICATION_FACTOR/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/int result/long result/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/static int calculateMultiplicationFactor/static long calculateMultiplicationFactor/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/static int convertToFixed/static long convertToFixed/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/int coordinate/long coordinate/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+sed -i 's/(int)/(long)/g' src/org/openstreetmap/osmosis/core/util/FixedPrecisionCoordinateConvertor.java 
+
+sed -i 's/getInt("latitude")/getLong("latitude")/g' src/org/openstreetmap/osmosis/core/apidb/v0_6/impl/NodeRowMapper.java 
+sed -i 's/getInt("longitude")/getLong("longitude")/g' src/org/openstreetmap/osmosis/core/apidb/v0_6/impl/NodeRowMapper.java 
+
+sed -i 's/sr.readInteger/sr.readLong/g' src/org/openstreetmap/osmosis/core/domain/v0_6/Node.java 
+sed -i 's/sw.writeInteger/sw.writeLong/g' src/org/openstreetmap/osmosis/core/domain/v0_6/Node.java 
+
+sed -i 's/sr.readInteger/sr.readLong/g' src/org/openstreetmap/osmosis/core/domain/v0_5/Node.java 
+sed -i 's/sw.writeInteger/sw.writeLong/g' src/org/openstreetmap/osmosis/core/domain/v0_5/Node.java 
+
+sed -i 's/0.#######/0.################/g' src/org/openstreetmap/osmosis/core/xml/v0_6/impl/NodeWriter.java 
+
+sed -i 's/setInt(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/setLong(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/g' src/org/openstreetmap/osmosis/core/apidb/v0_6/ApidbWriter.java 
+sed -i 's/setInt(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/setLong(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/g' src/org/openstreetmap/osmosis/core/apidb/v0_6/impl/ChangeWriter.java 
+
+sed -i 's/setInt(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/setLong(prmIndex++, FixedPrecisionCoordinateConvertor.convertToFixed/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/MysqlWriter.java 
+
+sed -i '248s/setInt/setLong/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/impl/ChangeWriter.java 
+sed -i '250s/setInt/setLong/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/impl/ChangeWriter.java 
+sed -i '285s/setInt/setLong/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/impl/ChangeWriter.java 
+sed -i '287s/setInt/setLong/g' src/org/openstreetmap/osmosis/core/mysql/v0_5/impl/ChangeWriter.java 
+
+sed -i 's/writeInt(FixedPrecisionCoordinateConvertor.convertToFixed/writeLong(FixedPrecisionCoordinateConvertor.convertToFixed/g' src/org/openstreetmap/osmosis/core/pgsql/v0_6/impl/PersistentNodeLocationStore.java 
+
+cp -f /mnt/scripts/$CM_ENV/InMemoryNodeLocationStore.java src/org/openstreetmap/osmosis/core/pgsql/v0_6/impl/
+
+
+
+echo "# Run osmosis ant" 
+date 
+cd ~/download/svn/osmosis
+ant 
+
+
+
+### Set up osmosis replication sink
+#
+#nice /root/download/svn/osmosis/bin/osmosis --read-replication-interval-init workingDirectory="/mnt/osmosis-replication" 
+### (set up at boot time for now)
+
+## Sysadmin support
+
+# Allow Webmin to access this database
+
+yum -y install perl-DBD-Pg
+### TODO: Is this feasible if port is not 5432?
+
+
+
+
+# Get osm2pgsql dependencies
+echo "## Get osm2pgsql dependencies" 
+date
+
+## Commented out, the geos 3.2.2 custom build in rebuild.db-tile
+## should also provide this
+#yum -y install geos-devel 
+
+yum -y install proj-devel 
+
+
+# Get and build osm2pgsql itself
+echo "## Get and build osm2pgsql itself" 
+date
+ 
+mkdir -p ~/download/svn 
+cd ~/download/svn 
+svn checkout http://svn.openstreetmap.org/applications/utils/export/osm2pgsql/
+cd ~/download/svn/osm2pgsql
+
+echo "## autogen.sh osm2pgsql" 
+date
+./autogen.sh
+
+echo "## configure osm2pgsql" 
+date
+./configure
+
+# Add PostgreSQL 9.0 path for access to pg_config
+# Should have no side-effect for PostgreSQL 8.x-only systems
+PATH=/usr/pgsql-9.0/bin:$PATH
+
+echo "## make osm2pgsql" 
+date
+make
+
+echo "## make install osm2pgsql" 
+date
+make install
+
+mkdir -p /usr/share/osm2pgsql
+cp ~/download/svn/osm2pgsql/default.style /usr/share/osm2pgsql/default.style 
+
+
+
+## First time import
+
+# Do the planet import
+echo "## Do the planet import" 
+date
+
+
+# Seed the tile rendering database with the latest full planet file
+mkdir -p /mnt/db-tile-incoming-planet
+cd /mnt/db-tile-incoming-planet
+rm -f commonmap.planet.earth.latest.osm
+wget http://planet.$CM_ENV.commonmap.org/commonmap.planet.earth.latest.osm
+
+echo "# Importing planet ..." 
+date
+su - postgres -c "osm2pgsql -P $PGSQL_SERVICE_PORT -d mod_tile_pr --slim /mnt/db-tile-incoming-planet/commonmap.planet.earth.latest.osm" 
+
+#su - postgres -c "osm2pgsql -P $PGSQL_SERVICE_PORT -d mod_tile_pr --slim /var/www/commonmap/planet/public/commonmap.planet.earth.latest.osm"
+echo "# Imported planet ..." 
+date
+
+
+### Now in rebuild.tile.local
+#mkdir -p /var/lib/mod_tile
+##touch /var/lib/mod_tile/planet-import-complete
+#chown -R apache:apache /var/lib/mod_tile
+### TODO: Is chown really required here?
+
+
+# initialise the osmosis temporary directories for frequent updates
+echo "# initialise the osmosis temporary directories for frequent updates" 
+date
+mkdir -p /mnt/db-tile-incoming-osmosis-replication
+/root/download/svn/osmosis/bin/osmosis --read-replication-interval-init workingDirectory=/mnt/db-tile-incoming-osmosis-replication
+
+sed -i "s/openstreetmap\.org/$CM_ENV.commonmap.org/g" /mnt/db-tile-incoming-osmosis-replication/configuration.txt
+sed -i "s/minute/hour/g" /mnt/db-tile-incoming-osmosis-replication/configuration.txt
+sed -i "s/3600/12600/g" /mnt/db-tile-incoming-osmosis-replication/configuration.txt
+
+
+# Let the cron jobs know what environment it's in
+cp $DIR/rc.dynamic.environment.inc.sh $DIR/../local
+
+# Add an hourly task to update the tile rendering database
+ln -s /mnt/scripts/$CM_ENV/rc.dynamic.planet2db-tile.local /etc/cron.hourly/order.50.db-tile.rebuild
+
+
+## Add replication to munin statistics
+echo "## Add replication to munin statistics" 
+date
+
+# Get just enough of mod_tile to get at its munin plugins
+mkdir -p ~/download/svn 
+cd ~/download/svn 
+svn checkout http://svn.openstreetmap.org/applications/utils/mod_tile/
+
+# Copy munin plugins over
+cd ~/download/svn/mod_tile/munin
+# Don't symlink, as we we will be changing the name of the replication target later.
+#ln -s /root/download/svn/mod_tile/munin/replication_* /etc/munin/plugins/
+cp replication_* /etc/munin/plugins/
+# Note: Don't 'ln -s' the above as per the usual munin idiom,
+# also since the munin server won't be able to read into
+# the root home directory.
+ 
+
+# Adjust statistic target for munin statistic "replication delay"
+sed -i "s/home\/osm\/replicate/mnt\/db-tile-incoming-osmosis-replication/g" /etc/munin/plugins/replication_delay
+
+# Pick up new munin state
+service munin-node restart
+
+
+
+mail -s "[commonmap-bots] db-tile.$CM_ENV.commonmap.org is built" root@commonmap.info < /mnt/instance/meta-data.log
+
+#### Established db-tile service
+echo "####" 
+echo "#### Established db-tile service" 
+echo "####" 
+date 
+
+# ENDS.

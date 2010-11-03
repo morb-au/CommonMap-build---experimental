@@ -1,0 +1,151 @@
+#!/bin/bash
+#
+# A Script to build the base RightScale CentOS 5.4 Amazon Machine Image 
+#       ami-f8b35e91 (32 bit)
+#     or
+#       ami-ccb35ea5 (64 bit)
+# Into a mixed workload server for CommonMap purposes
+#   http://commonmap.info/w/index.php/Server/Setup/Demonstration/AWS
+
+# Copyright Brendan Morley (morb_au), 2010
+#
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+# The general script actions are as follows:
+#
+# * Install common frameworks for each server role.
+# * For each server role, install role-specifc components.
+# * Update to the latest CentOS 5.4 patch level.
+#
+# The required server roles for this server are taken
+# from the AWS user-data specified when this server was
+# first deployed (i.e. from http://169.254.169.254/latest/user-data)
+#
+
+
+# Variables
+
+DIR="$( cd "$( dirname "$0" )" && pwd )"
+source $DIR/rc.dynamic.environment.inc.sh
+
+echo "##############################################"
+echo "#### Starting rc.dynamic.rebuild.all.local"
+echo "##############################################"
+date
+
+
+# Get the User Data for this instance
+userdata=`curl http://169.254.169.254/latest/user-data`
+instanceid=`curl http://169.254.169.254/latest/meta-data/instance-id`
+securitygroups=`curl http://169.254.169.254/latest/meta-data/security-groups` 
+manifest=`curl http://169.254.169.254/latest/meta-data/ami-manifest-path`
+TIMESTAMP=`date -u +"%Y-%m-%d %H:%M:%S"` 
+
+## Tattoo these details on to the Message Of The Day
+
+echo "This is a CommonMap server for the roles: '$userdata'." >> /etc/motd
+echo "Built at $TIMESTAMP UTC, from:" >> /etc/motd
+echo "$manifest" >> /etc/motd
+echo "" >> /etc/motd
+
+
+mail -s "[commonmap-bots] A $CM_ENV.commonmap.org is getting $userdata roles built" root@commonmap.info < echo "Instance ID $instanceid"
+
+echo "####"
+echo "#### Calling rc.dynamic.rebuild.local"
+echo "####"
+date
+/mnt/scripts/$CM_ENV/rc.dynamic.rebuild.local
+
+
+for token in $userdata
+do 
+
+  case $token in
+
+    db-core) 
+      echo "####"
+      echo "#### Calling rc.dynamic.rebuild.db-core.local"
+      echo "####"
+      date
+      /mnt/scripts/$CM_ENV/rc.dynamic.rebuild.db-core.local
+    ;;
+    
+    
+    
+    api) 
+      echo "####"
+      echo "#### Calling rc.dynamic.rebuild.api.local"
+      echo "####"
+      date
+      /mnt/scripts/$CM_ENV/rc.dynamic.rebuild.api.local
+    ;;
+    
+    
+    
+    planet) 
+      echo "####"
+      echo "#### Calling rc.dynamic.rebuild.planet.local"
+      echo "####"
+      date
+      /mnt/scripts/$CM_ENV/rc.dynamic.rebuild.planet.local
+    ;;
+
+
+
+    db-tile) 
+      echo "####"
+      echo "#### Calling rc.dynamic.rebuild.db-tile.local"
+      echo "####"
+      date
+      /mnt/scripts/$CM_ENV/rc.dynamic.rebuild.db-tile.local
+    ;;
+    
+    
+    
+    tile) 
+      echo "####"
+      echo "#### Calling rc.dynamic.rebuild.tile.local"
+      echo "####"
+      date
+      /mnt/scripts/$CM_ENV/rc.dynamic.rebuild.tile.local
+    ;;
+    
+  esac
+  
+done
+ 
+echo "####"
+echo "#### Running yum update"
+echo "####"
+date
+yum -y update
+
+mail -s "[commonmap-bots] A $CM_ENV.commonmap.org has $userdata roles built" root@commonmap.info < /mnt/instance/meta-data.log
+
+echo "###############################################"
+echo "#### Completed rc.dynamic.rebuild.all.local"
+echo "###############################################"
+date
+
+
+# ENDS.
